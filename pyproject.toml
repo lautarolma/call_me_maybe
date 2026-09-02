@@ -1,0 +1,50 @@
+[project]
+name = "call-me-maybe"
+version = "0.1.0"
+description = "LLM function calling with constrained decoding"
+requires-python = ">=3.10"
+dependencies = [
+    "llm-sdk",
+    "pydantic>=2.0.0",
+    "numpy>=1.24.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "flake8>=7.0.0",
+    "mypy>=1.10.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# PyTorch CPU index, prioritized over PyPI: it contains only torch-ecosystem
+# packages, so torch resolves to the CPU-only build (this machine has no GPU
+# and the default PyPI wheel pulls gigabytes of useless nvidia-* CUDA deps).
+# Every other package still resolves from PyPI.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+
+[tool.uv.sources]
+llm-sdk = { path = "./llm_sdk", editable = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+# llm_sdk is a provided third-party package with no type stubs, and tests/
+# are not graded by the subject — exclude both from direct checking (analogous
+# to .flake8's extend-exclude). The override below additionally stops mypy from
+# following llm_sdk's imports from src/.
+exclude = "(llm_sdk/|tests/)"
+
+[[tool.mypy.overrides]]
+# llm_sdk ships no type stubs; treat it as Any instead of resolving it as a
+# namespace package from the repo root.
+module = "llm_sdk"
+follow_imports = "skip"

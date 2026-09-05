@@ -13,6 +13,13 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 #: Allowed JSON types for function parameters.
+#: Solo los 4 tipos ESCALARES de JSON entran en el MVP. Los compuestos
+#: (objects/dicts y arrays) quedan FUERA del scope del proyecto a propósito:
+#: validar y hacer constrained decoding de un parámetro anidado requiere una
+#: máquina de estados + schema recursivo mucho más complejo.
+#: ⭐ BONUS B8 ("complex nested function arguments"): para habilitarlo, agregar
+#: "object" y "array" a este Literal y extender FunctionDef/schema_validator
+#: para manejar tipos anidados. NO tocar hasta que el MVP esté verde.
 ParameterType = Literal["string", "number", "boolean", "null"]
 
 

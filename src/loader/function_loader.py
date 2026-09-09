@@ -17,8 +17,8 @@ from src.models.function_definition import FunctionDef
 def load_functions(path: Path) -> list[FunctionDef]:
     """Load and validate function definitions.
 
-    Raises ValueError for missing/malformed files, non-list payloads,
-    invalid entries or duplicate function names.
+    Raises ValueError for missing/malformed files, empty arrays,
+    non-list payloads, invalid entries or duplicate function names.
 
     Args:
         path: Path to the functions definition JSON file.
@@ -60,31 +60,30 @@ def load_functions(path: Path) -> list[FunctionDef]:
         raise ValueError(f"Invalid JSON in functions file {path}: {exc}") from exc
 
     # Validación de forma ANTES de validar contenido: esperamos un array
-    # JSON (que json.load convirtió a list). Un dict suelto o un string
-    # fallarían después de forma críptica al hacer **item.
-    if not isinstance(data, list):
-        raise ValueError(f"Expected a JSON array of function definitions in {path}")
+    # JSON (que json.load convirtió a list) y NO vacío. Un dict suelto, un
+    # string o una lista vacía fallan acá, con mensaje claro, ANTES de
+    # construir modelos (fail fast) — cierra la asimetría con input_loader.py,
+    # ver BUG-002 en BITACORA_BUGS.md.
+    if not isinstance(data, list) or len(data) == 0:
+        raise ValueError(f"Expected a non-empty JSON array of function definitions in {path}")
 
-    # `FunctionDef(**item)` desempaqueta cada dict como keyword arguments:
-    # {"name": "fn_x", ...} -> FunctionDef(name="fn_x", ...).
-    # El __init__ NO es el generado por Python: pydantic lo reescribe en la
-    # definición de la clase para VALIDAR cada campo contra sus anotaciones
-    # (tipos, Literal, campos requeridos). Si algo no cumple, lanza
-    # pydantic.ValidationError — que también es subclase de ValueError,
-    # así que este método cumple su contrato sin código extra.
-    functions = [FunctionDef(**item) for item in data]
-
-    # Detección de duplicados. OJO con la complejidad: `names.count(name)`
-    # recorre la lista entera por CADA nombre -> O(n²). Para ~10 funciones
-    # es irrelevante; para miles usarías collections.Counter:
-    #   from collections import Counter
-    #   dup_counts = Counter(names); duplicates = sorted(n for n, c in dup_counts.items() if c > 1)
-    #
-    # Anatomía de la comprehension:
-    #   {name for name in names if names.count(name) > 1}  -> set comprehension
-    #   (el set elimina repetidos del resultado) -> sorted(...) devuelve lista ordenada
-    names = [fn.name for fn in functions]
-    duplicates = sorted({name for name in names if names.count(name) > 1})
-    if duplicates:
-        raise ValueError(f"Duplicate function names: {duplicates}")
+    # Una sola pasada: construye Y valida a la vez.
+    # - `FunctionDef(**item)` desempaqueta cada dict como keyword arguments.
+    #   Pydantic reescribe el __init__ para VALIDAR cada campo contra sus
+    #   anotaciones (tipos, Literal, campos requeridos). Si algo no cumple,
+    #   lanza pydantic.ValidationError — subclase de ValueError, así el
+    #   contrato del método se cumple sin código extra.
+    # - `seen` es un set (hash table): consultar/registrar un nombre es O(1);
+    #   el loop total es O(n). Detectar el duplicado ACÁ corta el procesamiento
+    #   en la primera reincidencia (fail-fast real), en vez de construir toda
+    #   la lista y contar después con names.count() (O(n²) de la versión
+    #   anterior).
+    seen: set[str] = set()
+    functions: list[FunctionDef] = []
+    for item in data:
+        fn = FunctionDef(**item)
+        if fn.name in seen:
+            raise ValueError(f"Duplicate function name: {fn.name}")
+        seen.add(fn.name)
+        functions.append(fn)
     return functions

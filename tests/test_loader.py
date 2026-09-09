@@ -78,7 +78,13 @@ class TestLoadFunctions:
             },
         ]
         f.write_text(json.dumps(payload), encoding="utf-8")
-        with pytest.raises(ValueError, match="Duplicate function names"):
+        with pytest.raises(ValueError, match="Duplicate function name"):
+            load_functions(f)
+
+    def test_empty_list_raises(self, tmp_path: Path) -> None:
+        f = tmp_path / "empty_functions.json"
+        f.write_text("[]", encoding="utf-8")
+        with pytest.raises(ValueError, match="non-empty JSON array"):
             load_functions(f)
 
     def test_missing_file_raises(self, tmp_path: Path) -> None:

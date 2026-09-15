@@ -38,9 +38,11 @@ _HEX_DIGITS = "0123456789abcdefABCDEF"
 _SIMPLE_ESCAPES = frozenset('"\\/nrtbf')
 
 # Grammar de number JSON:  -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
-#   _NUMBER_PREFIX_RE: versión "a medio terminar" (acepta "2.", "2e+", "-")
-#   para la validación incremental char por char; los * permiten dígitos
-#   pendientes. Rechaza leading zeros ("01") porque la primera alternativa
+#   _NUMBER_PREFIX_RE: versión "a medio terminar" (acepta "2." y "2e+")
+#   para la validación incremental char por char. El signo inicial "-" se
+#   incorpora en _step_colon() y debe ser seguido por un dígito. Los *
+#   permiten cero o más caracteres en las partes que pueden quedar pendientes.
+#   Rechaza leading zeros ("01") porque la primera alternativa
 #   solo tolera "0" SOLO, y la segunda no puede arrancar con cero.
 #   OJO la alternancia de la parte decimal: "2.e" DEBE fallar (un punto sin
 #   dígitos deja la fracción pendiente: el exponente solo es legal DESPUÉS

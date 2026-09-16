@@ -9,6 +9,7 @@ ROL DE ESTE __init__.py (por dentro):
 
 from src.decoder.schema_validator import SchemaContext
 from src.decoder.state import DecoderPhase, DecoderState
+from src.decoder.token_filter import compute_allowed_ids
 from src.decoder.trie import TrieNode, build_trie, find_node, is_complete_name, valid_next_chars
 
 __all__ = [
@@ -17,6 +18,7 @@ __all__ = [
     "SchemaContext",
     "TrieNode",
     "build_trie",
+    "compute_allowed_ids",
     "find_node",
     "is_complete_name",
     "valid_next_chars",

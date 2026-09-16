@@ -13,6 +13,8 @@ POR QUÉ EXISTE ESTE MÓDULO (por dentro):
   trabajo de schema_validator.py (Task 3.3). Acá solo se garantiza SINTAXIS
   JSON sobre el subconjunto del subject: objeto con keys, values string /
   number / bool / null, y UN nivel de anidamiento (parameters).
+  Única concesión: name_buffer acumula el TEXT del value de "name"
+  (desvío Task 3.3) — bookkeeping que el schema lee, no validación.
 
 CONTRATO DE USO (dos caminos):
 - simulate(token_text) -> (bool, DecoderState): EXPLORA sin tocar el estado
@@ -99,6 +101,16 @@ class DecoderState:
     keys_enclosed: set[str] = field(default_factory=set)  # Solo keys de parameters
     depth: int = 0                     # 0 = output object, 1 = parameters
     number_buffer: str = ""            # Acumula el number en curso
+    # ⚠ DESVÍO DOCUMENTADO (Task 3.3): la máquina acumula el TEXT del value
+    # de la key "name" (depth 0) para que SchemaContext resuelva la función
+    # seleccionada. Mismo espíritu que keys_enclosed: bookkeeping que el
+    # schema LEE, no validación sintáctica. Los escapes se SKIPPEAN: el
+    # buffer queda con el nombre "decodificado" (\u0066n_... → fn_...).
+    # ¿Por qué acá y no en el schema? Un token BPE puede mezclar estructura
+    # y contenido ('fn_add_numbers", "parameters": {'); reconstruir el span
+    # del name desde el estado post-token obligaría a re-simular el token.
+    # El único lugar que ve los chars en contexto es la state machine.
+    name_buffer: str = ""              # Text del value de "name" (depth 0)
     bool_buffer: str = ""              # Acumula true/false/null en curso
     unicode_remaining: int = 0         # Hex pendientes de un \uXXXX en curso
 
@@ -141,6 +153,7 @@ class DecoderState:
         self.keys_enclosed = new_state.keys_enclosed
         self.depth = new_state.depth
         self.number_buffer = new_state.number_buffer
+        self.name_buffer = new_state.name_buffer
         self.bool_buffer = new_state.bool_buffer
         self.unicode_remaining = new_state.unicode_remaining
         return True
@@ -288,6 +301,11 @@ class DecoderState:
         if char in _WS:
             return True
         if char == '"':
+            # ⚠ DESVÍO DOCUMENTADO (Task 3.3): arranca un value de "name"
+            # NUEVO → reset del buffer acumulado. OJO el depth: el parámetro
+            # "name" de fn_greet vive en depth 1 y NO resetea el del output.
+            if self.current_key == "name" and self.depth == 0:
+                self.name_buffer = ""
             self.phase = DecoderPhase.IN_STRING_VALUE
             return True
         if char == "{":
@@ -332,6 +350,12 @@ class DecoderState:
         if char == "\\":
             self.phase = DecoderPhase.ESCAPE_IN_STRING
             return True
+        # ⚠ DESVÍO DOCUMENTADO (Task 3.3): acumula el text del value de
+        # "name" SOLO en el name del output object (depth 0). Los chars en
+        # ESCAPE_IN_STRING y los hex de \uXXXX ya pasaron por arriba
+        # (skippeados): el buffer queda con el nombre "decodificado".
+        if self.current_key == "name" and self.depth == 0:
+            self.name_buffer += char
         return True
 
     def _step_number(self, char: str) -> bool:

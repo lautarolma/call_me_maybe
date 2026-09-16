@@ -29,6 +29,7 @@ class TestPhaseEnum:
         assert s.keys_enclosed == set()
         assert s.depth == 0
         assert s.number_buffer == ""
+        assert s.name_buffer == ""
         assert s.bool_buffer == ""
         assert s.unicode_remaining == 0
 
@@ -381,3 +382,49 @@ class TestExpectedFirstChars:
         s = DecoderState()
         assert s.update_from_text(FULL_JSON)
         assert s.expected_first_chars() == set()
+
+
+class TestNameBuffer:
+    """⚠ Desvío documentado (Task 3.3): la máquina acumula el value de "name".
+
+    Solamente el value de la key "name" del OUTPUT object (depth 0) entra al
+    buffer; estructura, keys y values de parameters NO lo tocan. Los escapes
+    se skippean: el buffer queda con el nombre "decodificado".
+    """
+
+    def test_accumulates_only_name_value_chars(self) -> None:
+        s = DecoderState()
+        assert s.update_from_text('{"name": "fn_add_numbers"')
+        assert s.name_buffer == "fn_add_numbers"
+        # Estructura posterior (incluida la key "parameters" y sus values)
+        # NO entra al buffer ni lo pisa.
+        assert s.update_from_text(', "parameters": {"a": 2.0}')
+        assert s.name_buffer == "fn_add_numbers"
+
+    def test_param_named_name_does_not_fill_buffer(self) -> None:
+        """fn_greet tiene un parámetro "name" (depth 1): no debe entrar."""
+
+        s = DecoderState()
+        assert s.update_from_text('{"name": "fn_greet", "parameters": {')
+        assert s.name_buffer == "fn_greet"
+        assert s.update_from_text('"name": "Javier"}')
+        # El value del parámetro "name" NO se acumula (depth == 1).
+        assert s.name_buffer == "fn_greet"
+
+    def test_escapes_skipped_in_buffer(self) -> None:
+        """Escapes simples (\\n) y \\uXXXX se skippean: el buffer queda con
+        el nombre "decodificado" sin los caracteres de escape."""
+
+        s = DecoderState()
+        # \n se consume como escape: f + (skip \n) + _greet = "f_greet"
+        assert s.update_from_text('{"name": "f\\n_greet"')
+        assert s.name_buffer == "f_greet"
+
+    def test_name_buffer_resets_on_new_name_value(self) -> None:
+        """Un segundo value de "name" (sintácticamente válido) resetea."""
+
+        s = DecoderState()
+        assert s.update_from_text('{"name": "fn_add_numbers", "parameters": {}')
+        assert s.name_buffer == "fn_add_numbers"
+        assert s.update_from_text(', "name": "fn_greet"}')
+        assert s.name_buffer == "fn_greet"

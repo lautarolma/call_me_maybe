@@ -109,6 +109,7 @@ class SchemaContext:
         "_depth",
         "_keys_enclosed",
         "_phase",
+        "_params_object_seen",
         "selected_function",
     )
 
@@ -120,6 +121,10 @@ class SchemaContext:
         self._depth = 0
         self._keys_enclosed: set[str] = set()
         self._phase = DecoderPhase.ROOT
+        #: True si el recorrido pasó por PARAMS_OBJECT (el '{' de "parameters").
+        #: Lo setea update() y lo consume el pase fino del generator (Inciso
+        #: 4.1.1): cierra el gap del plan "output object sin parameters".
+        self._params_object_seen = False
         #: Función elegida por el value de "name" (None hasta resolverse).
         self.selected_function: FunctionDef | None = None
 
@@ -137,6 +142,8 @@ class SchemaContext:
         # (nunca mutado in-place) — copiar es gratis y evita aliasing raro.
         self._keys_enclosed = set(state.keys_enclosed)
         self._depth = state.depth
+        if state.phase is DecoderPhase.PARAMS_OBJECT:
+            self._params_object_seen = True
         self._resolve_function(state)
 
     def current_expected_type(self) -> str | None:
@@ -186,6 +193,17 @@ class SchemaContext:
     def can_close_params(self) -> bool:
         """True si el '}' de cierre de parameters está permitido ahora."""
         return self.all_required_present()
+
+    def has_seen_params_object(self) -> bool:
+        """True si el recorrido pasó por el '{' del objeto "parameters".
+
+        LO CONSUME EL PASO FINO del generator (Inciso 4.1.1): cuando el
+        estado llega a COMPLETE, exige que este flag esté encendido. Cierra
+        el gap del plan "output object sin parameters" ('{"name":"fn"}'
+        completo sin el objeto parameters jamás se emite). El flag lo setea
+        update() cuando ve PARAMS_OBJECT (solo el '{' lo produce).
+        """
+        return self._params_object_seen
 
     # ------------------------------------------------ Fase 3 del filter (3.4)
 

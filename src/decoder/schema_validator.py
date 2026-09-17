@@ -326,11 +326,20 @@ class SchemaContext:
           name-antes-de-parameters en la práctica, porque el '}' de cierre
           también se bloquea sin función (cláusula 4) y el generador no puede
           salir del objeto parameters sin haber nombrado la función.
-        - Limitación residual: una key re-emitida con texto IDÉNTICO al
-          commiteado (la máquina la resetea a "" y la reconstruye igual) no
-          se detecta como cambio. Duplicados exactos en el MISMO texto de key
-          que ya estuviera commiteado sí se bloquean; el caso "reset y
-          reconstrucción idéntica en un solo token" escapa (raro en BPE).
+        - Limitación residual 1 (duplicado): una key re-emitida con texto
+          IDÉNTICO al commiteado (la máquina la resetea a "" y la reconstruye
+          igual) no se detecta como cambio. Duplicados exactos en el MISMO
+          texto de key que ya estuviera commiteado sí se bloquean; el caso
+          "reset y reconstrucción idéntica en un solo token" escapa (raro en
+          BPE).
+        - Limitación residual 2 (DESCUBIERTA): el trigger exige self._depth
+          == 1 COMMITEADO; un token que ENTRA a parameters y abre la PRIMERA
+          key en el MISMO paso ('", "parameters": {"a') arranca en depth 0 →
+          `self._depth != 1` abstiene y la key jamás se valida, ni en este
+          token ni en los siguientes (el trigger por cambio no vuelve a
+          disparar: current_key sigue siendo "a"). La key entra de contrabando
+          y el schema la acepta de por vida. Raro en BPE real (token de ~20
+          chars); el pase fino post-argmax (viable en Task 4.1) lo cierra.
         """
         if self._depth != 1:
             return True  # output keys (depth 0): fuera del scope del schema

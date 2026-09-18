@@ -86,7 +86,13 @@ def generate(
     - El pase fino del Inciso 4.1.1 vive en el argmax: _pick_best_token()
       descarta los candidatos que no pasan _passes_fine_validation().
     """
-    input_ids = model.encode(prompt).tolist()
+    # ⚠ BUG-005 (2026-09-18): el SDK devuelve un tensor 2D [1, N]; [0].tolist()
+    # lo aplana a list[int] — el contrato que espera get_logits_from_input_ids.
+    input_ids = model.encode(prompt)[0].tolist()
+    # Longitud del prompt ANTES del loop: input_ids después solo crece con los
+    # best_id generados, así el slice final separa prompt de generados sin
+    # re-encodear (antes se re-encodeaba y len() contaba FILAS del tensor 2D).
+    prompt_length = len(input_ids)
     state = DecoderState()
     schema = SchemaContext(functions)
 
@@ -121,9 +127,9 @@ def generate(
         if state.phase is DecoderPhase.COMPLETE:
             break
 
-    # Solo los tokens GENERADOS (no el prompt) — el plan re-encodea el prompt
-    # para medir su longitud (costo 1 encode extra, despreciable).
-    prompt_length = len(model.encode(prompt).tolist())
+    # Solo los tokens GENERADOS (no el prompt): prompt_length se calculó antes
+    # del loop sobre los ids reales del prompt (BUG-005). Sin el [0].tolist(),
+    # len() contaría las FILAS del tensor 2D y el slice arrastraría tokens.
     generated_ids = input_ids[prompt_length:]
     generated = model.decode(generated_ids)
 

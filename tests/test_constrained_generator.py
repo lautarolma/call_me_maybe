@@ -238,7 +238,26 @@ class TestFineValidationMissingParamsObject:
 
 
 class _FakeTensor:
-    """Dummy con .tolist() — evita depender de torch en los tests."""
+    """Dummy que REPLICA la forma 2D [1, N] del tensor real de encode().
+
+    BUG-005: Small_LLM_Model.encode() arma torch.tensor([ids]) → 2D; su
+    .tolist() devuelve list[list[int]]. Antes este dummy devolvía una lista
+    PLANA (1D) y el bug de dimensiones pasaba desapercibido en la suite.
+    """
+
+    def __init__(self, ids: list[int]) -> None:
+        self._ids = ids
+
+    def __getitem__(self, idx: int) -> _FakeRow:
+        # t[0] de un tensor 2D [1, N] → vista 1D [N]
+        return _FakeRow(self._ids)
+
+    def tolist(self) -> list[list[int]]:
+        return [list(self._ids)]
+
+
+class _FakeRow:
+    """Vista 1D de una fila de tensor (t[0].tolist() → list[int] plano)."""
 
     def __init__(self, ids: list[int]) -> None:
         self._ids = ids
@@ -268,7 +287,14 @@ class FakeModel:
         return "".join(self._vocab.id2decoded[tid] for tid in ids)
 
     def get_logits_from_input_ids(self, input_ids: list[int]) -> list[float]:
-        step = len(input_ids) - 1  # prompt_length == 1
+        # BUG-005: contrato de FORMAS con el SDK real — get_logits espera
+        # list[int] PLANO. Si generate() dejara de aplanar ([0].tolist()), acá
+        # entraría list[list[int]] y este assert tiñe la suite de rojo.
+        assert all(isinstance(x, int) for x in input_ids), (
+            "get_logits_from_input_ids debe recibir list[int] plano, "
+            f"no {type(input_ids[0]).__name__}"
+        )
+        step = len(input_ids) - 1  # prompt_length == N del encode
         logits = [-100.0] * self._vocab.vocab_size
         if step < len(self._sequence):
             logits[IDS[self._sequence[step]]] = 100.0
@@ -317,3 +343,29 @@ class TestGenerator:
         generated, ok = generate(model, "boo", vocab, FUNCTIONS, trie, max_tokens=3)
         assert not ok  # sin COMPLETE en 3 tokens
         assert generated.startswith("{")  # el token ganador fue el '{'
+
+    def test_n_token_prompt_does_not_leak_into_generated(self) -> None:
+        """BUG-005 (regresión): el prompt de N tokens NO se cuela en el output.
+
+        encode() devuelve tensor 2D con ids que NO existen en el vocab del
+        test (999/777/555). Si generated_ids incluyera tokens del prompt (por
+        prompt_length mal calculado), FakeModel.decode haría KeyError — fallo
+        ruidoso. Con el fix, prompt_length == 3 y generated solo tiene '{'.
+        """
+        vocab = build_vocab()
+        trie = build_trie([fn.name for fn in FUNCTIONS])
+
+        class _PromptfulModel(FakeModel):
+            """encode() de 3 tokens — ninguno existe en VOCAB (KeyError si
+            alguno llegara a generated_ids)."""
+
+            def encode(self, text: str) -> _FakeTensor:  # noqa: D102
+                return _FakeTensor([999, 777, 555])
+
+        generated, ok = generate(
+            _PromptfulModel(vocab, ["{"]),
+            "prompt largo", vocab, FUNCTIONS, trie, max_tokens=1,
+        )
+        assert not ok  # solo 1 token generado: sin COMPLETE
+        # El único token generado fue '{' (id 1): nada de prompt en el output.
+        assert generated == "{"

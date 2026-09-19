@@ -97,7 +97,30 @@ def generate(
     schema = SchemaContext(functions)
 
     for _ in range(max_tokens):
+        # ─── M5: Skip-if-single (Anexo de Latencia) ───
+        # Check first WITHOUT model call. In non-wildcard phases, the
+        # candidate set is small (~10-100 tokens) so the full filter is fast.
+        # If exactly 1 candidate exists, we can skip the 2.6s forward.
+        allowed_check = compute_allowed_ids(state, schema, vocab, trie)
+        if (
+            len(allowed_check) == 1
+            and "*" not in state.expected_first_chars()
+        ):
+            best_id = next(iter(allowed_check))
+            token_text = vocab.id2decoded.get(best_id)
+            if token_text is None:
+                break
+            input_ids.append(best_id)
+            if not state.update_from_text(token_text):
+                break
+            schema.update(state)
+            if state.phase is DecoderPhase.COMPLETE:
+                break
+            continue
+
+        # ─── Ambiguous step: consult model ───
         logits = model.get_logits_from_input_ids(input_ids)
+        # M1/M2: Top-1 opportunistic + Top-K masking via logits
         allowed = compute_allowed_ids(state, schema, vocab, trie, logits)
 
         if not allowed:

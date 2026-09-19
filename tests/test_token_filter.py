@@ -157,7 +157,7 @@ def step(state: DecoderState, schema: SchemaContext, text: str) -> None:
 def allowed(
     state: DecoderState, schema: SchemaContext, vocab: Vocab, trie: object
 ) -> set[int]:
-    return compute_allowed_ids(state, schema, vocab, trie, [])
+    return compute_allowed_ids(state, schema, vocab, trie)
 
 
 class TestRootAcceptance:

@@ -27,7 +27,7 @@ import json
 # `@dataclass` es un decorador que GENERA código boilerplate en tiempo de
 # definición de la clase: __init__, __repr__ y __eq__ automáticos a partir
 # de las anotaciones de clase. Es azúcar sintáctico de PEP 557.
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from llm_sdk import Small_LLM_Model
 
@@ -71,7 +71,39 @@ class Vocab:
     # miles. Esa diferencia define si la generación es usable o no.
     tokens_starting_with: dict[str, set[int]]
     vocab_size: int
+    # Pre-computed: decoded first-char set for each DecoderPhase. Built once
+    # at startup so the filter can O(1) test "is this token valid for this
+    # phase?" without importing DecoderState/DecoderPhase (avoids circular
+    # imports and startup cost). Keys are phase NAME strings.
+    valid_by_phase: dict[str, set[int]] = field(default_factory=dict)
 
+
+
+# Simplified mapping: phase name -> set of first-decoded-char that are valid
+# for that phase in the COMMON case (no dynamic state dependency). Used to
+# build valid_by_phase at startup. Dynamic phases (IN_NUMBER_VALUE) fall back
+# to the full filter.
+_WS_SIMPLIFIED = frozenset(" \t\n\r")
+_DIGITS_SIMPLIFIED = frozenset("0123456789")
+_HEX_SIMPLIFIED = frozenset("0123456789abcdefABCDEF")
+_SIMPLE_ESCAPES_SIMPLIFIED = frozenset('"\\/nrtbf')
+
+_PHASE_FIRST_CHARS: dict[str, frozenset[str]] = {
+    "ROOT": frozenset({"{"} | _WS_SIMPLIFIED),
+    "OBJECT_OPEN": frozenset({'"'} | _WS_SIMPLIFIED),
+    "IN_OBJECT": frozenset({'"', "}"} | _WS_SIMPLIFIED),
+    "KEY_START": frozenset({"*"}),     # wildcard
+    "IN_KEY": frozenset({"*"}),        # wildcard
+    "KEY_END": frozenset({":"} | _WS_SIMPLIFIED),
+    "COLON": frozenset({'"', "-", "{", "t", "f", "n"} | _DIGITS_SIMPLIFIED | _WS_SIMPLIFIED),
+    "IN_STRING_VALUE": frozenset({"*"}),  # wildcard
+    "IN_NUMBER_VALUE": _DIGITS_SIMPLIFIED | frozenset({"-"}),  # conservative
+    "IN_BOOL_VALUE": frozenset({"t", "f"}),   # conservative (true/false)
+    "IN_NULL_VALUE": frozenset({"n"}),         # conservative
+    "ESCAPE_IN_STRING": _SIMPLE_ESCAPES_SIMPLIFIED | frozenset({"u"}),
+    "VALUE_END": frozenset({",", "}"} | _WS_SIMPLIFIED),
+    "PARAMS_OBJECT": frozenset({'"', "}"} | _WS_SIMPLIFIED),
+}
 
 def load_vocab(model: Small_LLM_Model) -> Vocab:
     """Load the model vocabulary and build pre-indexed structures.
@@ -143,6 +175,26 @@ def load_vocab(model: Small_LLM_Model) -> Vocab:
         id2decoded[token_id] = decoded
         tokens_starting_with.setdefault(first_char, set()).add(token_id)
 
+
+    # ── Pre-compute valid_by_phase (M4: Anexo de Latencia) ──
+    # Maps phase name -> set of token IDs whose decoded first-char is valid.
+    # Wildcard phases ("*") get ALL non-byte tokens — same as full filter.
+    all_non_byte_ids: set[int] = set()
+    for _fc, _ids in tokens_starting_with.items():
+        if _fc != BYTE_CATEGORY:
+            all_non_byte_ids.update(_ids)
+
+    valid_by_phase: dict[str, set[int]] = {}
+    for _phase_name, _chars in _PHASE_FIRST_CHARS.items():
+        if "*" in _chars:
+            # Wildcard: all non-byte tokens are candidates
+            valid_by_phase[_phase_name] = set(all_non_byte_ids)
+        else:
+            _ids: set[int] = set()
+            for _ch in _chars:
+                _ids.update(tokens_starting_with.get(_ch, set()))
+            valid_by_phase[_phase_name] = _ids
+
     return Vocab(
         token2id=token2id,
         id2token=id2token,
@@ -150,4 +202,5 @@ def load_vocab(model: Small_LLM_Model) -> Vocab:
         tokens_starting_with=tokens_starting_with,
         # len(dict) es O(1): los dicts de Python cachean su tamaño.
         vocab_size=len(token2id),
+        valid_by_phase=valid_by_phase,
     )

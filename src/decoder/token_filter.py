@@ -40,6 +40,14 @@ from src.decoder.state import DecoderState
 from src.decoder.trie import TrieNode
 from src.loader.vocab_loader import BYTE_CATEGORY, Vocab
 
+# Tiers para el escalonamiento del Top-K masking (M2).
+# En vez de validar K=2000 candidatos de golpe, se valida por tandas
+# crecientes. Si el top-1 pasa → retorno inmediato (O(1)).
+# Si no, se prueban los siguientes 5, luego 10, 20, etc.
+# El beneficio: en el caso promedio, el token válido está en los
+# primeros 50-100 candidatos → se validan ~50 en vez de 2000.
+TIER_SIZES: list[int] = [1, 5, 10, 20, 50, 100, 200, 500, 1000, 2000]
+
 
 def _is_clean_utf8(text: str) -> bool:
     """True si el texto decodificado no tiene marcadores de bytes inválidos.
@@ -64,7 +72,8 @@ def compute_allowed_ids(
     schema: SchemaContext,
     vocab: Vocab,
     trie: TrieNode,
-    logits: list[float],
+    logits: list[float] | None = None,
+    top_k: int = 2000,
 ) -> set[int]:
     """Computa el set de ids permitidos para el próximo step de generación.
 
@@ -73,8 +82,14 @@ def compute_allowed_ids(
         schema: SchemaContext ya sincronizado con state (update(state)).
         vocab: Vocabulario pre-indexado (id2decoded + tokens_starting_with).
         trie: Trie de nombres de función (build_trie).
-        logits: Preferencias del modelo (NO se consumen acá; el argmax vive
-            en Task 4.1 sobre el set retornado — por eso la firma del plan).
+        logits: Preferencias del modelo. Si se provee, se usa Top-1
+            opportunistic (fast-path) y Top-K masking para reducir el
+            universo de candidatos de ~151K a top_k. Si es None (skip-if-
+            single), se ejecuta el filtro completo (necesario para determinar
+            si hay exactamente 1 candidato).
+        top_k: Máximo de candidatos a validar cuando se usan logits.
+            Default 2000 (conservador: Qwen asigna ~99% de masa a ~1000
+            tokens).
 
     Returns:
         set de ids cuyo texto decodificado mantiene el output válido.
@@ -103,6 +118,56 @@ def compute_allowed_ids(
         candidate_ids = set()
         for char in expected_chars:
             candidate_ids.update(vocab.tokens_starting_with.get(char, set()))
+
+    # ─── OPTIMIZACIÓN (Anexo de Latencia — M1/M2) ───
+    # Si logits se proveyeron, usar Top-1 opportunistic (O(1)) y luego
+    # Top-K masking (O(K)) para reducir el universo de candidatos.
+    if logits is not None:
+        # M1: Top-1 Opportunistic — si el token con mayor logit pasa
+        # simulate + allows_token, retornar directamente (O(1), <0.1ms).
+        best_id = max(range(len(logits)), key=lambda i: logits[i])
+        best_decoded = vocab.id2decoded.get(best_id)
+        if (
+            best_decoded is not None
+            and _is_clean_utf8(best_decoded)
+        ):
+            valid, new_state = state.simulate(best_decoded)
+            if valid and schema.allows_token(best_decoded, new_state, trie):
+                return {best_id}
+
+        # M2: Top-K Masking con escalonamiento por tiers.
+        # En vez de validar K candidatos de golpe, se validan por tandas
+        # crecientes. Se retorna en cuanto un candidato pasa.
+        import heapq
+        # Pre-sort: los top_k IDs de mayor logit, en orden descendente.
+        ranked_ids = heapq.nlargest(
+            top_k, range(len(logits)), key=logits.__getitem__
+        )
+        # Intersección con candidate_ids de Fase 1: solo los que
+        # matchean el bucket.
+        ranked_ids = [tid for tid in ranked_ids if tid in candidate_ids]
+
+        # Escalonamiento: validar por tiers hasta encontrar uno que pase.
+        checked = 0
+        for tier_size in TIER_SIZES:
+            end = min(checked + tier_size, len(ranked_ids))
+            for idx in range(checked, end):
+                token_id = ranked_ids[idx]
+                decoded = vocab.id2decoded.get(token_id)
+                if decoded is None or not _is_clean_utf8(decoded):
+                    continue
+                valid, new_state = state.simulate(decoded)
+                if not valid:
+                    continue
+                if schema.allows_token(decoded, new_state, trie):
+                    return {token_id}
+            checked = end
+            if checked >= len(ranked_ids):
+                break
+
+        # Fallback: si ningún tier encontró uno válido, retornar vacío
+        # (el caller manejará el empty set).
+        return set()
 
     # Fase 2: validación char-by-char (state machine) sobre texto decodificado.
     allowed_ids: set[int] = set()

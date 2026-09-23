@@ -36,7 +36,7 @@ QUÉ NO HACE (separación de concerns):
 from __future__ import annotations
 
 from src.decoder.schema_validator import SchemaContext
-from src.decoder.state import DecoderState
+from src.decoder.state import DecoderPhase, DecoderState
 from src.decoder.trie import TrieNode
 from src.loader.vocab_loader import BYTE_CATEGORY, Vocab
 
@@ -109,8 +109,22 @@ def compute_allowed_ids(
     expected_chars = state.expected_first_chars()
 
     # Fase 1: pre-filtro por primer carácter (decodificado).
-    if "*" in expected_chars:
-        candidate_ids: set[int] = set()
+    _STATIC_PREINDEX_PHASES = {
+        DecoderPhase.ROOT,
+        DecoderPhase.OBJECT_OPEN,
+        DecoderPhase.IN_OBJECT,
+        DecoderPhase.KEY_END,
+        DecoderPhase.COLON,
+        DecoderPhase.ESCAPE_IN_STRING,
+        DecoderPhase.VALUE_END,
+        DecoderPhase.PARAMS_OBJECT,
+    }
+
+    if state.phase in _STATIC_PREINDEX_PHASES:
+        candidate_ids: set[int] = vocab.valid_by_phase[state.phase.value]
+
+    elif "*" in expected_chars:
+        candidate_ids = set()
         for first_char, ids in vocab.tokens_starting_with.items():
             if first_char != BYTE_CATEGORY:
                 candidate_ids.update(ids)

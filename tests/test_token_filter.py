@@ -25,7 +25,11 @@ from src.decoder.schema_validator import SchemaContext
 from src.decoder.state import DecoderState
 from src.decoder.token_filter import compute_allowed_ids
 from src.decoder.trie import build_trie
-from src.loader.vocab_loader import BYTE_CATEGORY, Vocab
+from src.loader.vocab_loader import (
+    BYTE_CATEGORY,
+    Vocab,
+    _STATIC_PHASE_FIRST_CHARS,
+)
 from src.models.function_definition import FunctionDef, ParameterDef
 
 # Replica de data/input/functions_definition.json (subset usado en tests).
@@ -133,12 +137,21 @@ def build_vocab() -> Vocab:
             id2decoded[tid] = text
             starting.setdefault(text[0], set()).add(tid)
     starting.setdefault(BYTE_CATEGORY, set()).add(60)
+    valid_by_phase = {
+        phase: {
+            tid
+            for ch in phase_chars
+            for tid in starting.get(ch, set())
+        }
+        for phase, phase_chars in _STATIC_PHASE_FIRST_CHARS.items()
+    }
     return Vocab(
         token2id={text: tid for tid, text in VOCAB.items()},
         id2token={tid: text for tid, text in VOCAB.items()},
         id2decoded=id2decoded,
         tokens_starting_with=starting,
         vocab_size=len(VOCAB) + 1,
+        valid_by_phase=valid_by_phase,
     )
 
 

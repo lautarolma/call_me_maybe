@@ -106,11 +106,11 @@ def generate(
         if "*" not in expected_chars:
             allowed_check = compute_allowed_ids(state, schema, vocab, trie)
             if len(allowed_check) == 1:
-                best_id = next(iter(allowed_check))
-                token_text = vocab.id2decoded.get(best_id)
+                single_id = next(iter(allowed_check))
+                token_text = vocab.id2decoded.get(single_id)
                 if token_text is None:
                     break
-                input_ids.append(best_id)
+                input_ids.append(single_id)
                 if not state.update_from_text(token_text):
                     break
                 schema.update(state)

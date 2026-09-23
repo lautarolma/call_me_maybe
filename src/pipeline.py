@@ -87,7 +87,6 @@ def run(args: argparse.Namespace) -> int:
     print("[5/5] Building trie ...")
     trie_node = build_trie([function.name for function in functions])
 
-
     print()
     print("=== Phase 1 summary ===")
     print(f"  functions : {len(functions)}")
@@ -106,6 +105,5 @@ def run(args: argparse.Namespace) -> int:
             with measure_time(f"Prompt {i}"):
                 output: tuple[str, bool] = generate(model, prompt, vocab, functions, trie_node)
                 print(f"  result : {output[0]}")
-
 
     return 0

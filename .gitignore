@@ -31,3 +31,7 @@ data/output/
 # AI assistant context (local only — no es parte de la submission del subject VIII)
 CLAUDE.md
 
+# Scratch y backups del refactor (fueron commiteados por error; quedan en disco, fuera del track)
+.scratch_task42/
+.refactor_backup_mario_validation/
+

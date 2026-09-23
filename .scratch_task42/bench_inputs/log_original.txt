@@ -1,12 +1,0 @@
-[0] set=original | threads=4 | watchdog=600s/prompt
-[1] Loading functions ...
-    5 funciones: ['fn_add_numbers', 'fn_greet', 'fn_reverse_string', 'fn_get_square_root', 'fn_substitute_string_with_regex']
-[2] Loading prompts ...
-[3] Initializing model (carga pesada, paciencia) ...
-Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
-Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights:  26%|██▌       | 80/311 [00:00<00:00, 755.92it/s]Loading weights:  50%|█████     | 156/311 [00:01<00:01, 133.93it/s]Loading weights:  62%|██████▏   | 193/311 [00:01<00:00, 121.17it/s]Loading weights:  70%|███████   | 218/311 [00:01<00:00, 107.55it/s]Loading weights:  76%|███████▌  | 236/311 [00:01<00:00, 98.77it/s] Loading weights:  80%|████████  | 250/311 [00:02<00:00, 95.27it/s]Loading weights:  84%|████████▍ | 262/311 [00:02<00:00, 92.67it/s]Loading weights:  88%|████████▊ | 273/311 [00:02<00:00, 83.48it/s]Loading weights:  92%|█████████▏| 287/311 [00:02<00:00, 89.75it/s]Loading weights:  96%|█████████▌| 298/311 [00:02<00:00, 92.02it/s]Loading weights: 100%|██████████| 311/311 [00:02<00:00, 110.49it/s]
-    model listo en 8.4s
-[4] Building vocab index (~150k decodes, tarda) ...
-    vocab_size=151643 en 10.8s
-[5] Building trie ...
-[ 1/11] OK   98.9s | 'What is the sum of 2 and 3?'

@@ -7,7 +7,7 @@ generation is implemented in later phases.
 
 from __future__ import annotations
 from src.prompt.prompt_builder import build_prompt
-from src.utils.timer import measure_time
+from src.utils.metrics import measure_time, track_prompt
 from src.decoder.constrained_generator import generate
 from src.decoder.trie import build_trie
 
@@ -99,11 +99,16 @@ def run(args: argparse.Namespace) -> int:
     print()
     print("All components loaded OK. Generation arrives in Phase 3.")
 
-#   CREAR UNA LISTA PARA AÑADIR CADA OUTPUT, PARA FINALMENTE AL ACABAR ESCRIBIR EL FICHERO OUTPUT.JS
+    # Los resultados se acumulan para imprimirlos fuera del loop: el ciclo de
+    # generación queda libre de prints y mediciones directas (eso vive en
+    # src/utils/metrics.py). Task 5.2 persistirá esta lista en args.output.
+    results: list[str] = []
     with measure_time("Prueba completa"):
         for i, prompt in enumerate(prompts):
-            with measure_time(f"Prompt {i}"):
-                output: tuple[str, bool] = generate(model, prompt, vocab, functions, trie_node)
-                print(f"  result : {output[0]}")
+            with track_prompt(i):
+                results.append(generate(model, prompt, vocab, functions, trie_node)[0])
+
+    for i, result in enumerate(results):
+        print(f"  result : {result}")
 
     return 0

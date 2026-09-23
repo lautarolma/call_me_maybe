@@ -1,0 +1,116 @@
+[
+  {
+    "i": 1,
+    "query": "What is the sum of 2 and 3?",
+    "ok_full": true,
+    "ok_fn": true,
+    "errors": [],
+    "gen_s": 41.3,
+    "timeout": false,
+    "output": null
+  },
+  {
+    "i": 2,
+    "query": "What is the sum of 265 and 345?",
+    "ok_full": true,
+    "ok_fn": true,
+    "errors": [],
+    "gen_s": 50.0,
+    "timeout": false,
+    "output": null
+  },
+  {
+    "i": 3,
+    "query": "Greet shrek",
+    "ok_full": true,
+    "ok_fn": true,
+    "errors": [],
+    "gen_s": 27.1,
+    "timeout": false,
+    "output": null
+  },
+  {
+    "i": 4,
+    "query": "Greet john",
+    "ok_full": true,
+    "ok_fn": true,
+    "errors": [],
+    "gen_s": 26.1,
+    "timeout": false,
+    "output": null
+  },
+  {
+    "i": 5,
+    "query": "Reverse the string 'hello'",
+    "ok_full": true,
+    "ok_fn": true,
+    "errors": [],
+    "gen_s": 25.5,
+    "timeout": false,
+    "output": null
+  },
+  {
+    "i": 6,
+    "query": "Reverse the string 'world'",
+    "ok_full": true,
+    "ok_fn": true,
+    "errors": [],
+    "gen_s": 26.4,
+    "timeout": false,
+    "output": null
+  },
+  {
+    "i": 7,
+    "query": "What is the square root of 16?",
+    "ok_full": true,
+    "ok_fn": true,
+    "errors": [],
+    "gen_s": 30.7,
+    "timeout": false,
+    "output": null
+  },
+  {
+    "i": 8,
+    "query": "Calculate the square root of 144",
+    "ok_full": true,
+    "ok_fn": true,
+    "errors": [],
+    "gen_s": 33.1,
+    "timeout": false,
+    "output": null
+  },
+  {
+    "i": 9,
+    "query": "Replace all numbers in \"Hello 34 I'm 233 years old\" with NUMBERS",
+    "ok_full": false,
+    "ok_fn": true,
+    "errors": [
+      "replacement='NUMBER' !~ 'NUMBERS'"
+    ],
+    "gen_s": 42.3,
+    "timeout": false,
+    "output": "\n\n{\n  \"name\": \"fn_substitute_string_with_regex\",\n  \"parameters\": {\n    \"source_string\": \"Hello 34 I'm 233 years old\",\n    \"regex\": \"\\\\d+\",\n    \"replacement\": \"NUMBER\"\n  }\n}\n"
+  },
+  {
+    "i": 10,
+    "query": "Replace all vowels in 'Programming is fun' with asterisks",
+    "ok_full": false,
+    "ok_fn": true,
+    "errors": [
+      "regex='([aeiouAEIOU])' !~ ['[aeiouAEIOU]', '[aeiou]']"
+    ],
+    "gen_s": 40.8,
+    "timeout": false,
+    "output": "\n\n{\n  \"name\": \"fn_substitute_string_with_regex\",\n  \"parameters\": {\n    \"source_string\": \"Programming is fun\",\n    \"regex\": \"([aeiouAEIOU])\",\n    \"replacement\": \"*\"\n  }\n}\n"
+  },
+  {
+    "i": 11,
+    "query": "Substitute the word 'cat' with 'dog' in 'The cat sat on the mat with another cat'",
+    "ok_full": true,
+    "ok_fn": true,
+    "errors": [],
+    "gen_s": 40.9,
+    "timeout": false,
+    "output": null
+  }
+]

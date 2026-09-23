@@ -5,9 +5,8 @@ POR QUÉ EXISTE ESTE MÓDULO (por dentro):
   logits del modelo, los filtra a los ids que mantienen el output como JSON
   válido (compute_allowed_ids), elige por argmax el mejor token permitido,
   commitea el estado y repite hasta COMPLETE o el límite de tokens.
-- Es el ÚNICO consumidor de compute_allowed_ids: el filter (Task 3.4) reduce
-  los ~151K ids del vocab a un set pequeño; acá vive el argmax que la firma
-  del filter tenía reservado (el filter NO consume logits).
+- Es el consumidor del filtro: usa compute_allowed_ids para pasos
+  deterministas y el iterador rankeado para pasos ambiguos.
 
 INCISO 4.1.1 — PASO FINO POST-ARgMAX (corrección documentada en el plan):
 - Los gaps de las cláusulas del schema (documentados en sus docstrings) son
@@ -50,7 +49,7 @@ from llm_sdk import Small_LLM_Model
 
 from src.decoder.schema_validator import SchemaContext
 from src.decoder.state import DecoderPhase, DecoderState
-from src.decoder.token_filter import compute_allowed_ids
+from src.decoder.token_filter import compute_allowed_ids, iter_ranked_allowed_ids
 from src.decoder.trie import TrieNode
 from src.loader.vocab_loader import Vocab
 from src.models.function_definition import FunctionDef
@@ -82,9 +81,9 @@ def generate(
     CÓMO FUNCIONA (por dentro):
     - Mismo esqueleto que el pseudocódigo del plan (PLAN_DIDACTICO L1696):
       tokenizar prompt → estado/schema iniciales → por step: logits →
-      compute_allowed_ids → argmax → append → commit → COMPLETE?.
-    - El pase fino del Inciso 4.1.1 vive en el argmax: _pick_best_token()
-      descarta los candidatos que no pasan _passes_fine_validation().
+      filtro → selección → append → commit → COMPLETE?.
+    - El pase fino del Inciso 4.1.1 consume candidatos ordenados y descarta
+      los que no pasan _passes_fine_validation().
     """
     # ⚠ BUG-005 (2026-09-18): el SDK devuelve un tensor 2D [1, N]; [0].tolist()
     # lo aplana a list[int] — el contrato que espera get_logits_from_input_ids.
@@ -97,53 +96,46 @@ def generate(
     schema = SchemaContext(functions)
 
     for _ in range(max_tokens):
-        # ─── M5: Skip-if-single (Anexo de Latencia) ───
-        # Check first WITHOUT model call. In non-wildcard phases, the
-        # candidate set is small (~10-100 tokens) so the full filter is fast.
-        # If exactly 1 candidate exists, we can skip the 2.6s forward.
-        allowed_check = compute_allowed_ids(state, schema, vocab, trie)
-        if (
-            len(allowed_check) == 1
-            and "*" not in state.expected_first_chars() # Aqui el doble pase a todo el vocab
-        ):
-            best_id = next(iter(allowed_check))
-            token_text = vocab.id2decoded.get(best_id)
-            if token_text is None:
+        # M5: skip the model only when the state is not wildcard and the
+        # exact deterministic filter leaves a single candidate.
+        is_wildcard = "*" in state.expected_first_chars()
+        if not is_wildcard:
+            allowed_check = compute_allowed_ids(state, schema, vocab, trie)
+            if not allowed_check:
                 break
-            input_ids.append(best_id)
-            if not state.update_from_text(token_text):
-                break
-            schema.update(state)
-            if state.phase is DecoderPhase.COMPLETE:
-                break
-            continue
+            if len(allowed_check) == 1:
+                best_id = next(iter(allowed_check))
+                token_text = vocab.id2decoded.get(best_id)
+                if token_text is None:
+                    break
+                input_ids.append(best_id)
+                if not state.update_from_text(token_text):
+                    break
+                schema.update(state)
+                if state.phase is DecoderPhase.COMPLETE:
+                    break
+                continue
 
-        # ─── Ambiguous step: consult model ───
+        # Ambiguous step: consult the model exactly once, then search local
+        # candidates in descending logit order. Wildcards come here directly
+        # without first scanning the full vocabulary in the deterministic path.
         logits = model.get_logits_from_input_ids(input_ids)
-        # M1/M2: Top-1 opportunistic + Top-K masking via logits
-        allowed = compute_allowed_ids(state, schema, vocab, trie, logits)
+        selected: tuple[int, str] | None = None
+        for candidate_id, candidate_text in iter_ranked_allowed_ids(
+            state, schema, vocab, trie, logits
+        ):
+            if _passes_fine_validation(
+                functions, schema, state, trie, candidate_text
+            ):
+                selected = candidate_id, candidate_text
+                break
 
-        if not allowed:
-            # Empty set handling: el plan dice "attempt repair or break".
-            # MVP: break — el output queda truncado y success=False.
+        if selected is None:
             break
 
-        # Argmax sobre allowed + pase fino (Inciso 4.1.1): descarta el mejor
-        # candidato si no supera la re-simulación char-por-char.
-        best_id, token_text = _pick_best_token(
-            allowed, logits, state, schema, functions, vocab, trie
-        )
-        if best_id is None:
-            # Ningún candidato de allowed pasó el pase fino.
-            break
-
+        best_id, token_text = selected
         input_ids.append(best_id)
-
-        # ⚠ DESVÍO del plan (ver docstring del módulo): se commitea con el
-        # texto DECODIFICADO, el mismo que vio la state machine en simulate().
         if not state.update_from_text(token_text):
-            # No debería pasar: el filter ya validó este token en Fase 2.
-            # Defensivo: si ocurriera, el estado queda atómico (sin cambios).
             break
         schema.update(state)
 
@@ -157,34 +149,6 @@ def generate(
     generated = model.decode(generated_ids)
 
     return generated, state.phase is DecoderPhase.COMPLETE
-
-
-def _pick_best_token(
-    allowed: set[int],
-    logits: list[float],
-    state: DecoderState,
-    schema: SchemaContext,
-    functions: list[FunctionDef],
-    vocab: Vocab,
-    trie: TrieNode,
-) -> tuple[int | None, str]:
-    """Argmax sobre allowed, con pase fino del ganador (Inciso 4.1.1).
-
-    CÓMO FUNCIONA (por dentro):
-    - `max(allowed, key=lambda tid: logits[tid])` = argmax restringido al
-      set permitido: el token con logit más alto que el modelo prefiere.
-    - Si el ganador NO pasa _passes_fine_validation(), se descarta del set
-      y se elige el siguiente mejor. Devolver (None, "") = allowed agotado.
-    """
-    while allowed:
-        best_id = max(allowed, key=lambda tid: logits[tid])
-        token_text = vocab.id2decoded.get(best_id)
-        if token_text is not None and _passes_fine_validation(
-            functions, schema, state, trie, token_text
-        ):
-            return best_id, token_text
-        allowed.discard(best_id)
-    return None, ""
 
 
 def _passes_fine_validation(

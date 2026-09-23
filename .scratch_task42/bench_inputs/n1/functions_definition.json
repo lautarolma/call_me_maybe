@@ -1,0 +1,80 @@
+[
+  {
+    "name": "fn_calculate_rectangle_area",
+    "description": "Calculate the area of a rectangle given its width and height.",
+    "parameters": {
+      "width": {
+        "type": "number"
+      },
+      "height": {
+        "type": "number"
+      }
+    },
+    "returns": {
+      "type": "number"
+    }
+  },
+  {
+    "name": "fn_count_vowels",
+    "description": "Count how many vowels (a, e, i, o, u) a text contains.",
+    "parameters": {
+      "text": {
+        "type": "string"
+      }
+    },
+    "returns": {
+      "type": "number"
+    }
+  },
+  {
+    "name": "fn_is_palindrome",
+    "description": "Check if a word reads the same forward and backward.",
+    "parameters": {
+      "word": {
+        "type": "string"
+      }
+    },
+    "returns": {
+      "type": "boolean"
+    }
+  },
+  {
+    "name": "fn_to_uppercase",
+    "description": "Convert a text to uppercase letters.",
+    "parameters": {
+      "text": {
+        "type": "string"
+      }
+    },
+    "returns": {
+      "type": "string"
+    }
+  },
+  {
+    "name": "fn_get_max_of_two",
+    "description": "Return the larger of two numbers.",
+    "parameters": {
+      "a": {
+        "type": "number"
+      },
+      "b": {
+        "type": "number"
+      }
+    },
+    "returns": {
+      "type": "number"
+    }
+  },
+  {
+    "name": "fn_remove_vowels",
+    "description": "Remove all vowels from a text and return the result.",
+    "parameters": {
+      "text": {
+        "type": "string"
+      }
+    },
+    "returns": {
+      "type": "string"
+    }
+  }
+]

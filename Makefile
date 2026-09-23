@@ -4,7 +4,7 @@ install:
 	uv sync
 
 run:
-	uv run python -m src
+	uv run python -m src $(ARGS)
 
 debug:
 	uv run python -m src --help

@@ -28,3 +28,6 @@ data/output/
 *.tmp
 *.bak
 
+# AI assistant context (local only — no es parte de la submission del subject VIII)
+CLAUDE.md
+

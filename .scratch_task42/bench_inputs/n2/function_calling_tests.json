@@ -1,0 +1,35 @@
+[
+  {
+    "prompt": "Convert 25 celsius to kelvin"
+  },
+  {
+    "prompt": "What is 0 celsius in kelvin?"
+  },
+  {
+    "prompt": "Count the words in 'the quick brown fox'"
+  },
+  {
+    "prompt": "How many words are there in 'hello world'?"
+  },
+  {
+    "prompt": "Does 'hello' start with 'he'?"
+  },
+  {
+    "prompt": "Check if 'world' starts with 'wor'"
+  },
+  {
+    "prompt": "Join 'foo' and 'bar'"
+  },
+  {
+    "prompt": "Concatenate 'open' and 'source'"
+  },
+  {
+    "prompt": "Get the first character of 'python'"
+  },
+  {
+    "prompt": "What is the first character of 'banana'?"
+  },
+  {
+    "prompt": "Extract the last word of 'hello brave world'"
+  }
+]

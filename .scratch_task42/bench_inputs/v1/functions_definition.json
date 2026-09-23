@@ -1,0 +1,74 @@
+[
+  {
+    "name": "fn_multiply",
+    "description": "Multiply two numbers together and return their product.",
+    "parameters": {
+      "a": {
+        "type": "number"
+      },
+      "b": {
+        "type": "number"
+      }
+    },
+    "returns": {
+      "type": "number"
+    }
+  },
+  {
+    "name": "fn_power",
+    "description": "Raise a base number to an exponent and return the result.",
+    "parameters": {
+      "base": {
+        "type": "number"
+      },
+      "exponent": {
+        "type": "number"
+      }
+    },
+    "returns": {
+      "type": "number"
+    }
+  },
+  {
+    "name": "fn_concatenate",
+    "description": "Join two strings together in order and return the combined string.",
+    "parameters": {
+      "left": {
+        "type": "string"
+      },
+      "right": {
+        "type": "string"
+      }
+    },
+    "returns": {
+      "type": "string"
+    }
+  },
+  {
+    "name": "fn_reverse_words",
+    "description": "Reverse the order of the words in a sentence and return the result.",
+    "parameters": {
+      "text": {
+        "type": "string"
+      }
+    },
+    "returns": {
+      "type": "string"
+    }
+  },
+  {
+    "name": "fn_greater_than",
+    "description": "Check if the first number is greater than the second one.",
+    "parameters": {
+      "x": {
+        "type": "number"
+      },
+      "y": {
+        "type": "number"
+      }
+    },
+    "returns": {
+      "type": "boolean"
+    }
+  }
+]

@@ -1,0 +1,80 @@
+[
+  {
+    "name": "fn_to_kelvin",
+    "description": "Convert a temperature from Celsius to Kelvin.",
+    "parameters": {
+      "celsius": {
+        "type": "number"
+      }
+    },
+    "returns": {
+      "type": "number"
+    }
+  },
+  {
+    "name": "fn_count_words",
+    "description": "Count the number of words in a text.",
+    "parameters": {
+      "text": {
+        "type": "string"
+      }
+    },
+    "returns": {
+      "type": "number"
+    }
+  },
+  {
+    "name": "fn_starts_with",
+    "description": "Check if a text starts with a given prefix.",
+    "parameters": {
+      "text": {
+        "type": "string"
+      },
+      "prefix": {
+        "type": "string"
+      }
+    },
+    "returns": {
+      "type": "boolean"
+    }
+  },
+  {
+    "name": "fn_join_strings",
+    "description": "Join two strings together and return the combined result.",
+    "parameters": {
+      "left": {
+        "type": "string"
+      },
+      "right": {
+        "type": "string"
+      }
+    },
+    "returns": {
+      "type": "string"
+    }
+  },
+  {
+    "name": "fn_get_first_character",
+    "description": "Return the first character of a text.",
+    "parameters": {
+      "text": {
+        "type": "string"
+      }
+    },
+    "returns": {
+      "type": "string"
+    }
+  },
+  {
+    "name": "fn_get_last_word",
+    "description": "Extract the last word of a text.",
+    "parameters": {
+      "text": {
+        "type": "string"
+      }
+    },
+    "returns": {
+      "type": "string"
+    }
+  }
+]

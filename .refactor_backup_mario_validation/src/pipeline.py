@@ -6,9 +6,6 @@ generation is implemented in later phases.
 """
 
 from __future__ import annotations
-from src.utils.timer import measure_time
-from src.decoder.constrained_generator import generate
-from src.decoder.trie import build_trie
 
 import argparse
 
@@ -36,7 +33,7 @@ def run(args: argparse.Namespace) -> int:
       coordina a los especialistas en orden y propaga excepciones hacia
       `__main__.py`, que es quien las convierte en exit code 1.
     """
-    print(f"[1/5] Loading function definitions from {args.functions_definition} ...")
+    print(f"[1/4] Loading function definitions from {args.functions_definition} ...")
     # load_functions(path) -> list[FunctionDef]:
     #   abre el JSON, lo parsea con json.load, valida cada entrada contra el
     #   modelo pydantic FunctionDef (tipos, campos requeridos) y verifica que
@@ -44,14 +41,14 @@ def run(args: argparse.Namespace) -> int:
     #   mensaje descriptivo (ver function_loader.py para el detalle).
     functions = load_functions(args.functions_definition)
 
-    print(f"[2/5] Loading prompts from {args.input} ...")
+    print(f"[2/4] Loading prompts from {args.input} ...")
     # load_prompts(path) -> list[str]:
     #   mismo mecanismo de parseo JSON, pero acepta dos formatos: array de
     #   strings planos o array de objetos {"prompt": "..."}. Rechaza listas
     #   vacías (no tiene sentido correr un pipeline sin inputs).
     prompts = load_prompts(args.input)
 
-    print("[3/5] Initializing model (first run downloads weights from the HF Hub) ...")
+    print("[3/4] Initializing model (first run downloads weights from the HF Hub) ...")
     # Small_LLM_Model() SIN argumentos usa el default Qwen/Qwen3-0.6B.
     # QUÉ HACE POR DENTRO (llm_sdk):
     #   1. Elige device con prioridad mps > cuda > cpu:
@@ -75,7 +72,7 @@ def run(args: argparse.Namespace) -> int:
     #      lo que ahorra memoria y acelera cada forward pass.
     model = Small_LLM_Model()
 
-    print("[4/5] Building vocabulary index ...")
+    print("[4/4] Building vocabulary index ...")
     # load_vocab(model) -> Vocab:
     #   lee el vocab.json DEL MODELO (via get_path_to_vocab_file, que resuelve
     #   la ruta en el cache de HF) y pre-indexa cada token por su PRIMER
@@ -83,28 +80,14 @@ def run(args: argparse.Namespace) -> int:
     #   cuando el generador necesite "todos los tokens que empiezan con `"",
     #   responde en O(1) con un set de ids en vez de escanear 150k+ tokens.
     vocab = load_vocab(model)
-    print("[5/5] Building trie ...")
-    trie_node = build_trie([function.name for function in functions])
-
 
     print()
     print("=== Phase 1 summary ===")
     print(f"  functions : {len(functions)}")
     print(f"  prompts   : {len(prompts)}")
-    print(f"  trie_node : {len(trie_node.children)}")
-
     print(f"  vocab size: {vocab.vocab_size}")
     print(f"  first-char buckets : {len(vocab.tokens_starting_with)}")
     print(f"  output path: {args.output}")
     print()
     print("All components loaded OK. Generation arrives in Phase 3.")
-
-#   CREAR UNA LISTA PARA AÑADIR CADA OUTPUT, PARA FINALMENTE AL ACABAR ESCRIBIR EL FICHERO OUTPUT.JS
-    with measure_time("Prueba completa"):
-        for i, prompt in enumerate(prompts):
-            with measure_time(f"Prompt {i}"):
-                output: tuple[str, bool] = generate(model, prompt, vocab, functions, trie_node)
-                print(f"  result : {output[0]}")
-
-
     return 0

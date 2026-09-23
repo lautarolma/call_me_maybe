@@ -6,6 +6,7 @@ generation is implemented in later phases.
 """
 
 from __future__ import annotations
+from src.prompt.prompt_builder import build_prompt
 from src.utils.timer import measure_time
 from src.decoder.constrained_generator import generate
 from src.decoder.trie import build_trie
@@ -49,7 +50,7 @@ def run(args: argparse.Namespace) -> int:
     #   mismo mecanismo de parseo JSON, pero acepta dos formatos: array de
     #   strings planos o array de objetos {"prompt": "..."}. Rechaza listas
     #   vacías (no tiene sentido correr un pipeline sin inputs).
-    prompts = load_prompts(args.input)
+    prompts = [build_prompt(functions, prompt) for prompt in load_prompts(args.input)]
 
     print("[3/5] Initializing model (first run downloads weights from the HF Hub) ...")
     # Small_LLM_Model() SIN argumentos usa el default Qwen/Qwen3-0.6B.

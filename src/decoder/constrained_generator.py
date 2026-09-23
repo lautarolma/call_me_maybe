@@ -101,22 +101,22 @@ def generate(
         # Check first WITHOUT model call. In non-wildcard phases, the
         # candidate set is small (~10-100 tokens) so the full filter is fast.
         # If exactly 1 candidate exists, we can skip the 2.6s forward.
-        allowed_check = compute_allowed_ids(state, schema, vocab, trie)
-        if (
-            len(allowed_check) == 1
-            and "*" not in state.expected_first_chars() # Aqui el doble pase a todo el vocab
-        ):
-            best_id = next(iter(allowed_check))
-            token_text = vocab.id2decoded.get(best_id)
-            if token_text is None:
-                break
-            input_ids.append(best_id)
-            if not state.update_from_text(token_text):
-                break
-            schema.update(state)
-            if state.phase is DecoderPhase.COMPLETE:
-                break
-            continue
+
+        expected_chars = state.expected_first_chars()
+        if "*" not in expected_chars:
+            allowed_check = compute_allowed_ids(state, schema, vocab, trie)
+            if len(allowed_check) == 1:
+                best_id = next(iter(allowed_check))
+                token_text = vocab.id2decoded.get(best_id)
+                if token_text is None:
+                    break
+                input_ids.append(best_id)
+                if not state.update_from_text(token_text):
+                    break
+                schema.update(state)
+                if state.phase is DecoderPhase.COMPLETE:
+                    break
+                continue
 
         # ─── Ambiguous step: consult model ───
         logits = model.get_logits_from_input_ids(input_ids)

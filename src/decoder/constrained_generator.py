@@ -45,6 +45,7 @@ QUÉ NO HACE (separación de concerns):
 from __future__ import annotations
 
 from copy import copy
+from time import perf_counter
 
 from llm_sdk import Small_LLM_Model
 
@@ -54,8 +55,30 @@ from src.decoder.token_filter import compute_allowed_ids
 from src.decoder.trie import TrieNode
 from src.loader.vocab_loader import Vocab
 from src.models.function_definition import FunctionDef
+from src.utils.metrics import MetricsRun
 
 MAX_TOKENS = 200  # Safety net — el output esperado es ~30-60 tokens
+
+# Opt2 (Anexo de Latencia §2.2, CONTEXTO_REFACTOR.md): prefijo 100%
+# determinista por el schema — TODO output válido arranca con esta
+# estructura antes de que el LLM tenga que elegir el nombre real de la
+# función. Se tokeniza UNA vez con encode() y se inyecta sin forward ni
+# filtro (ver _inject_static_header): recorta los forwards estructurales
+# de ROOT/OBJECT_OPEN/KEY_START/IN_KEY/KEY_END/COLON medidos en el Anexo
+# (~8-11 por prompt, ~4.5-4.8s cada uno — el costo del forward() del
+# modelo es uniforme por step, no depende del tamaño del candidate set,
+# así que evitar el forward es la única palanca real acá).
+# ⚠ BUG-012 (2026-09-23): el header DEBE ser BYTE-EXACTO al formato natural
+# que el modelo produce solo (con las 2 newlines iniciales antes de '{',
+# como en el Anexo — la política compacta ya había fallado antes por lo
+# mismo, commit abortado 7bf38ed). Recortar esas newlines "porque total no
+# cuestan forward" (inyectar más texto no cuesta nada extra: TODO el header
+# se salta el modelo por igual) rompió P2 ('Greet shrek'): el modelo quedó
+# en un estado fuera de distribución y tokenizó el name como un "f" suelto
+# en vez de un chunk natural, dejando sin candidatos válidos el step
+# siguiente (ningún token entre los top-2000 por logit mantenía "f..." como
+# prefijo del trie). Con las newlines restauradas, P2 vuelve a completar.
+STATIC_HEADER = '\n\n{\n  "name": "'
 
 
 def generate(
@@ -65,6 +88,7 @@ def generate(
     functions: list[FunctionDef],
     trie: TrieNode,
     max_tokens: int = MAX_TOKENS,
+    metrics: MetricsRun | None = None,
 ) -> tuple[str, bool]:
     """Genera output JSON constrained para un prompt.
 
@@ -75,6 +99,8 @@ def generate(
         functions: Definiciones de función del schema.
         trie: Trie de nombres de función (build_trie(functions)).
         max_tokens: Límite de seguridad del bucle.
+        metrics: Acumulador opcional de métricas por fase; si se provee,
+            registra forwards, skips-if-single y tiempo por DecoderPhase.
 
     Returns:
         (texto_generado, éxito): éxito True si el estado llegó a COMPLETE.
@@ -95,60 +121,77 @@ def generate(
     prompt_length = len(input_ids)
     state = DecoderState()
     schema = SchemaContext(functions)
+    _inject_static_header(STATIC_HEADER, model, vocab, input_ids, state, schema)
 
     for _ in range(max_tokens):
-        # ─── M5: Skip-if-single (Anexo de Latencia) ───
-        # Check first WITHOUT model call. In non-wildcard phases, the
-        # candidate set is small (~10-100 tokens) so the full filter is fast.
-        # If exactly 1 candidate exists, we can skip the 2.6s forward.
+        step_phase = state.phase
+        step_start = perf_counter()
+        try:
+            # ─── M5: Skip-if-single (Anexo de Latencia) ───
+            # Check first WITHOUT model call. In non-wildcard phases, the
+            # candidate set is small (~10-100 tokens) so the full filter is
+            # fast. If exactly 1 candidate exists, we can skip the forward
+            # call entirely.
 
-        expected_chars = state.expected_first_chars()
-        if "*" not in expected_chars:
-            allowed_check = compute_allowed_ids(state, schema, vocab, trie)
-            if len(allowed_check) == 1:
-                single_id = next(iter(allowed_check))
-                token_text = vocab.id2decoded.get(single_id)
-                if token_text is None:
-                    break
-                input_ids.append(single_id)
-                if not state.update_from_text(token_text):
-                    break
-                schema.update(state)
-                if state.phase is DecoderPhase.COMPLETE:
-                    break
-                continue
+            expected_chars = state.expected_first_chars()
+            if "*" not in expected_chars:
+                allowed_check = compute_allowed_ids(state, schema, vocab, trie)
+                if len(allowed_check) == 1:
+                    if metrics is not None:
+                        metrics.add_skips(step_phase, 1)
+                    single_id = next(iter(allowed_check))
+                    token_text = vocab.id2decoded.get(single_id)
+                    if token_text is None:
+                        break
+                    input_ids.append(single_id)
+                    if not state.update_from_text(token_text):
+                        break
+                    schema.update(state)
+                    if state.phase is DecoderPhase.COMPLETE:
+                        break
+                    continue
 
-        # ─── Ambiguous step: consult model ───
-        logits = model.get_logits_from_input_ids(input_ids)
-        # M1/M2: Top-1 opportunistic + Top-K masking via logits
-        allowed = compute_allowed_ids(state, schema, vocab, trie, logits)
+            # ─── Ambiguous step: consult model ───
+            logits = model.get_logits_from_input_ids(input_ids)
+            if metrics is not None:
+                metrics.add_forward(step_phase)
+            # M1/M2: Top-1 opportunistic + Top-K masking via logits
+            allowed = compute_allowed_ids(state, schema, vocab, trie, logits)
 
-        if not allowed:
-            # Empty set handling: el plan dice "attempt repair or break".
-            # MVP: break — el output queda truncado y success=False.
-            break
+            if not allowed:
+                # Empty set handling: el plan dice "attempt repair or break".
+                # MVP: break — el output queda truncado y success=False.
+                break
 
-        # Argmax sobre allowed + pase fino (Inciso 4.1.1): descarta el mejor
-        # candidato si no supera la re-simulación char-por-char.
-        best_id, token_text = _pick_best_token(
-            allowed, logits, state, schema, functions, vocab, trie
-        )
-        if best_id is None:
-            # Ningún candidato de allowed pasó el pase fino.
-            break
+            # Argmax sobre allowed + pase fino (Inciso 4.1.1): descarta el
+            # mejor candidato si no supera la re-simulación char-por-char.
+            best_id, token_text = _pick_best_token(
+                allowed, logits, state, schema, functions, vocab, trie
+            )
+            if best_id is None:
+                # Ningún candidato de allowed pasó el pase fino.
+                break
 
-        input_ids.append(best_id)
+            input_ids.append(best_id)
 
-        # ⚠ DESVÍO del plan (ver docstring del módulo): se commitea con el
-        # texto DECODIFICADO, el mismo que vio la state machine en simulate().
-        if not state.update_from_text(token_text):
-            # No debería pasar: el filter ya validó este token en Fase 2.
-            # Defensivo: si ocurriera, el estado queda atómico (sin cambios).
-            break
-        schema.update(state)
+            # ⚠ DESVÍO del plan (ver docstring del módulo): se commitea con
+            # el texto DECODIFICADO, el mismo que vio la state machine en
+            # simulate().
+            if not state.update_from_text(token_text):
+                # No debería pasar: el filter ya validó este token en Fase 2.
+                # Defensivo: si ocurriera, el estado queda atómico.
+                break
+            schema.update(state)
 
-        if state.phase is DecoderPhase.COMPLETE:
-            break
+            if state.phase is DecoderPhase.COMPLETE:
+                break
+        finally:
+            # El timing del step se acumula en la fase en la que ARRANCÓ
+            # (step_phase); correr SIGUE el contrato con continue/break.
+            if metrics is not None:
+                metrics.add_elapsed(
+                    step_phase, (perf_counter() - step_start) * 1000.0
+                )
 
     # Solo los tokens GENERADOS (no el prompt): prompt_length se calculó antes
     # del loop sobre los ids reales del prompt (BUG-005). Sin el [0].tolist(),
@@ -157,6 +200,36 @@ def generate(
     generated = model.decode(generated_ids)
 
     return generated, state.phase is DecoderPhase.COMPLETE
+
+
+def _inject_static_header(
+    header: str,
+    model: Small_LLM_Model,
+    vocab: Vocab,
+    input_ids: list[int],
+    state: DecoderState,
+    schema: SchemaContext,
+) -> None:
+    """Precarga ``header`` en input_ids/state/schema sin llamar al modelo.
+
+    CÓMO FUNCIONA (por dentro):
+    - `model.encode(header)` tokeniza el prefijo UNA vez; cada id resultante
+      se commitea con el mismo `state.update_from_text` del loop principal
+      (mismo contrato: atómico, mueve la state machine char por char).
+    - Best-effort defensivo: `header` es JSON válido por construcción
+      (mismo grammar que valida `state.py`), así que no debería fallar. Si
+      algún id no decodifica o `update_from_text` rechaza el texto (p.ej.
+      un split de tokenizer inesperado), se corta la inyección ahí mismo
+      — el estado queda atómico (sin ese id) y el loop principal retoma
+      generando ese tramo por forward normal, sin crashear.
+    """
+    header_ids = model.encode(header)[0].tolist()
+    for token_id in header_ids:
+        decoded = vocab.id2decoded.get(token_id)
+        if decoded is None or not state.update_from_text(decoded):
+            break
+        input_ids.append(token_id)
+        schema.update(state)
 
 
 def _pick_best_token(

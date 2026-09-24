@@ -348,6 +348,20 @@ class DecoderState:
             self.phase = DecoderPhase.VALUE_END
             return True
         if char == "\\":
+            # ⚠ BUG-011 (2026-09-24): un escape dentro del value de "name"
+            # (depth 0) nunca toca name_buffer (se skippea, ver abajo) —
+            # el trie de schema_validator.py ve el buffer intacto y lo deja
+            # pasar indefinidamente. Rechazarlo ACÁ, al leer el '\' mismo,
+            # es lo único que cubre TODOS los casos sin importar cómo el
+            # BPE fusione el escape en un token (un token completo '\n' de
+            # 2 chars resuelve la fase ESCAPE_IN_STRING->IN_STRING_VALUE
+            # DENTRO de simulate(): el estado final que ve schema_validator
+            # nunca queda en ESCAPE_IN_STRING, así que un guard ahí NO lo
+            # atrapa). Ningún nombre real usa '\\'; los params SÍ pueden
+            # (regex '\\d+' de fn_substitute_string_with_regex) — por eso
+            # el guard es específico a current_key=="name" and depth==0.
+            if self.current_key == "name" and self.depth == 0:
+                return False
             self.phase = DecoderPhase.ESCAPE_IN_STRING
             return True
         # ⚠ DESVÍO DOCUMENTADO (Task 3.3): acumula el text del value de

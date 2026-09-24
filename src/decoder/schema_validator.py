@@ -238,9 +238,13 @@ class SchemaContext:
         - Values anidados (depth >= 2) escapan a estas cláusulas: el plan solo
           modela parámetros escalares de UN nivel (B8 futuro). La state
           machine ni siquiera sensa bien el depth a partir de 2.
-        - Un name con ESCAPES queda "incompleto" en el buffer (los escapes se
-          skippean en state.py): el trie lo bloquea por construcción. Es
-          conservador y correcto: los nombres reales no usan escapes.
+        - Un ESCAPE dentro del value de "name" NO queda bloqueado por el
+          trie "por construcción" (BUG-011): los escapes se skippean del
+          buffer en state.py, así que name_buffer no cambia y el prefijo
+          sigue siendo válido para siempre. El guard vive en
+          `state.py._step_string` (rechaza el '\\' al leerlo), NO acá: una
+          cláusula a nivel de token completo es ciega a un escape fusionado
+          en 1-2 tokens BPE que resuelve la fase internamente.
         """
         if not self._allows_name_value(new_state, trie):
             return False
@@ -304,6 +308,20 @@ class SchemaContext:
           name en ese token no se valida contra el trie (quedaría validado el
           de tokens posteriores... que ya no existen). Raro en vocabularios
           BPE reales; limitación documentada.
+        - BUG-011 (2026-09-23/24): un ESCAPE ('\\n', '\\t', ...) dentro del
+          value de "name" NO queda bloqueado por el trie "por construcción"
+          — los escapes se skippean del buffer en state.py, así que
+          name_buffer sigue siendo un prefijo válido. El fix REAL vive en
+          `state.py._step_string` (rechaza el '\\' al leerlo, si
+          current_key=="name" and depth==0): acá no alcanza, porque un
+          token BPE que sea el escape COMPLETO ('\\n' fusionado en 1-2
+          tokens) resuelve ESCAPE_IN_STRING → IN_STRING_VALUE DENTRO de
+          `state.simulate()` — el `new_state` final que llega a esta
+          cláusula nunca queda en ESCAPE_IN_STRING, así que un guard aquí
+          es ciego a ese caso (reproducido con 'Greet shrek': el filtro
+          devolvía ese token como único candidato, el pase fino lo
+          rechazaba, y sin más candidatos para probar la generación se
+          cortaba sin completar). Ver state.py para el guard vigente.
         """
         if (
             new_state.phase in _NAME_READ_PHASES

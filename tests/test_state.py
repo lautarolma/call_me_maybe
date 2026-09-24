@@ -411,14 +411,27 @@ class TestNameBuffer:
         # El value del parámetro "name" NO se acumula (depth == 1).
         assert s.name_buffer == "fn_greet"
 
-    def test_escapes_skipped_in_buffer(self) -> None:
-        """Escapes simples (\\n) y \\uXXXX se skippean: el buffer queda con
-        el nombre "decodificado" sin los caracteres de escape."""
+    def test_escape_rejected_in_name_value(self) -> None:
+        """BUG-011 (2026-09-24): un escape dentro del value de "name" se
+        rechaza AL LEER el '\\' — antes se skippeaba silenciosamente del
+        buffer, lo que dejaba el prefijo del trie intacto y permitía un
+        loop infinito de escapes en el generador (repro real: 'Greet
+        shrek' nunca cerraba el string). Ningún nombre real usa '\\'."""
 
         s = DecoderState()
-        # \n se consume como escape: f + (skip \n) + _greet = "f_greet"
-        assert s.update_from_text('{"name": "f\\n_greet"')
-        assert s.name_buffer == "f_greet"
+        assert s.update_from_text('{"name": "f')
+        assert not s.update_from_text("\\n_greet")
+        # Atómico: el estado no se movió, name_buffer sigue en "f".
+        assert s.name_buffer == "f"
+
+    def test_escapes_still_skipped_for_non_name_buffer_paths(self) -> None:
+        """El skip de escapes en name_buffer (Task 3.3) sigue vigente para
+        lo único que puede tocarlo: value de "name" SIN escapes. Esto solo
+        confirma que la acumulación normal (sin '\\') no cambió."""
+
+        s = DecoderState()
+        assert s.update_from_text('{"name": "fn_greet"')
+        assert s.name_buffer == "fn_greet"
 
     def test_name_buffer_resets_on_new_name_value(self) -> None:
         """Un segundo value de "name" (sintácticamente válido) resetea."""

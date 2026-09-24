@@ -250,6 +250,27 @@ class TestFineValidationMissingParamsObject:
         assert _passes_fine_validation(FUNCTIONS, schema, state, trie, "}")  # cierra output
 
 
+class TestFineValidationNameEscapeRejected:
+    """BUG-011 (2026-09-23): un escape dentro del value de "name" no debe
+    poder colarse infinitamente. name_buffer no lo toca (se skippea en
+    state.py), así que sin el guard explícito en _allows_name_value el
+    trie sigue viendo un prefijo válido y el generador nunca cierra el
+    string (repro real: 'Greet shrek' → 200 forwards en '\\n\\t\\t\\t...'
+    sin completar)."""
+
+    def test_escape_inside_name_value_blocked(self) -> None:
+        state, schema, vocab, trie = make_pipeline()
+        for t in ("{", '"name": ', '"', "f"):
+            step(state, schema, t)
+        assert not _passes_fine_validation(FUNCTIONS, schema, state, trie, "\\n")
+
+    def test_plain_continuation_of_name_still_passes(self) -> None:
+        state, schema, vocab, trie = make_pipeline()
+        for t in ("{", '"name": ', '"', "f"):
+            step(state, schema, t)
+        assert _passes_fine_validation(FUNCTIONS, schema, state, trie, "n_greet")
+
+
 class _FakeTensor:
     """Dummy que REPLICA la forma 2D [1, N] del tensor real de encode().
 

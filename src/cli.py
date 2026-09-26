@@ -19,7 +19,25 @@ from pathlib import Path
 # y abstrae las diferencias Windows (`\`) vs Unix (`/`).
 DEFAULT_FUNCTIONS_DEFINITION = Path("data/input/functions_definition.json")
 DEFAULT_INPUT = Path("data/input/function_calling_tests.json")
-DEFAULT_OUTPUT = Path("data/output/function_calls.json")
+
+# NOMBRE DEL ARCHIVO DE OUTPUT — por qué `function_calling_results.json`.
+#
+# El subject se contradice a sí mismo:
+#   · línea 350 (ejemplo de CLI)  → `data/output/function_calls.json`
+#   · línea 582 (V.4, formato)    → `data/output/function_calling_results.json`
+#   · línea 662 (V.6, testing)    → `output/function_calling_results.json`
+# Y la PLANILLA DE PEER REVIEW lo zanja sin ambigüedad: "Check that the output
+# file is created (default: data/output/function_calling_results.json, or the
+# path provided with --output)".
+#
+# O sea: 2 de 3 menciones en el subject + la planilla oficial apontam a
+# `function_calling_results.json`. Ese es el default. La mención de la línea
+# 350 no nos obliga a nada: es un ejemplo de cómo pasar `--output`, y si el
+# evaluador lo usa, escribe donde le digamos (`args.output`).
+#
+# Si se pasa `--output`, ese path gana: el default solo aplica cuando NO se
+# pasa el flag.
+DEFAULT_OUTPUT = Path("data/output/function_calling_results.json")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

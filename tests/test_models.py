@@ -66,14 +66,30 @@ class TestParameterDef:
 
 class TestFunctionCall:
     def test_valid_call(self) -> None:
-        call = FunctionCall(name="fn_greet", parameters={"name": "shrek"})
+        call = FunctionCall(
+            prompt="Greet shrek",
+            name="fn_greet",
+            parameters={"name": "shrek"},
+        )
+        assert call.prompt == "Greet shrek"
         assert call.name == "fn_greet"
         assert call.parameters == {"name": "shrek"}
 
     def test_default_empty_parameters(self) -> None:
-        call = FunctionCall(name="fn_greet")
+        call = FunctionCall(prompt="Greet shrek", name="fn_greet")
         assert call.parameters == {}
 
     def test_missing_name_raises(self) -> None:
         with pytest.raises(ValidationError):
-            FunctionCall(parameters={"a": 1})
+            FunctionCall(prompt="Greet shrek", parameters={"a": 1})
+
+    def test_missing_prompt_raises(self) -> None:
+        """El subject V.4 exige las 3 keys: prompt, name y parameters.
+
+        `prompt` es obligatorio: la moulinette compara
+        `student_answer["prompt"]` con `correction["prompt"]` por igualdad
+        exacta, así que un FunctionCall sin prompt no es serializable a una
+        entry válida del output.
+        """
+        with pytest.raises(ValidationError):
+            FunctionCall(name="fn_greet", parameters={"a": 1})

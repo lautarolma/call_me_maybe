@@ -1,15 +1,20 @@
-"""Pipeline orchestration for call_me_maybe (Phase 1 skeleton).
+"""Pipeline orchestration for call_me_maybe.
 
 Loads function definitions, prompts and the model vocabulary, initializes
-the model, prints a summary and returns a success exit code. Actual
-generation is implemented in later phases.
+the model, runs constrained generation over every prompt, validates each
+result and persists the output JSON required by the subject (V.4).
 """
 
 from __future__ import annotations
+import json
+from pathlib import Path
+
+from src.models.output import FunctionCall
 from src.prompt.prompt_builder import build_prompt
 from src.utils.metrics import measure_time, track_prompt
 from src.decoder.constrained_generator import generate
 from src.decoder.trie import build_trie
+from src.validator import build_results
 
 import argparse
 
@@ -50,7 +55,16 @@ def run(args: argparse.Namespace) -> int:
     #   mismo mecanismo de parseo JSON, pero acepta dos formatos: array de
     #   strings planos o array de objetos {"prompt": "..."}. Rechaza listas
     #   vacías (no tiene sentido correr un pipeline sin inputs).
-    prompts = [build_prompt(functions, prompt) for prompt in load_prompts(args.input)]
+    #
+    # POR QUÉ GUARDAMOS LAS DOS LISTAS: `build_prompt` inyecta las function
+    # definitions y produce el texto que ve el MODELO. El campo `prompt` de
+    # la salida tiene que ser el request ORIGINAL, sin las definitions —
+    # la moulinette lo compara con `correction["prompt"]` por igualdad
+    # EXACTA de string. Si guardáramos solo los prompts ya construidos,
+    # escribiríamos en el output el prompt con las definitions inyectadas, y
+    # la comparación fallaría en los 11 tests.
+    raw_prompts = load_prompts(args.input)
+    prompts = [build_prompt(functions, prompt) for prompt in raw_prompts]
 
     print("[3/5] Initializing model (first run downloads weights from the HF Hub) ...")
     # Small_LLM_Model() SIN argumentos usa el default Qwen/Qwen3-0.6B.
@@ -97,18 +111,52 @@ def run(args: argparse.Namespace) -> int:
     print(f"  first-char buckets : {len(vocab.tokens_starting_with)}")
     print(f"  output path: {args.output}")
     print()
-    print("All components loaded OK. Generation arrives in Phase 3.")
+    print("All components loaded OK. Starting constrained generation.")
 
     # Los resultados se acumulan para imprimirlos fuera del loop: el ciclo de
     # generación queda libre de prints y mediciones directas (eso vive en
-    # src/utils/metrics.py). Task 5.2 persistirá esta lista en args.output.
-    results: list[str] = []
+    # src/utils/metrics.py).
+    generated: list[str] = []
     with measure_time("Prueba completa"):
         for i, prompt in enumerate(prompts):
             with track_prompt(i):
-                results.append(generate(model, prompt, vocab, functions, trie_node)[0])
+                generated.append(generate(model, prompt, vocab, functions, trie_node)[0])
 
-    for i, result in enumerate(results):
+    for i, result in enumerate(generated):
         print(f"  result : {result}")
 
+    # --- Persistencia del entregable (subject V.4) -------------------------
+    # Convertimos cada string del decoder en una FunctionCall validada,
+    # emparejada con su prompt ORIGINAL, y escribimos el array a disco.
+    # `build_results` conserva el orden 1:1 con los prompts de entrada: la
+    # moulinette empareja con `zip()`, que es posicional.
+    results: list[FunctionCall] = build_results(raw_prompts, generated)
+    written = write_results(results, args.output)
+
+    print()
+    print(f"  wrote {len(results)} entries -> {written}")
     return 0
+
+
+def write_results(results: list[FunctionCall], path: Path) -> Path:
+    """Serializa los resultados al JSON de salida y lo escribe en disco.
+
+    Args:
+        results: Entries validadas, en el orden de los prompts de entrada.
+        path: Destino. El parent se crea si no existe (el subject exige que
+            el programa cree el directorio output/ durante la ejecución).
+
+    Returns:
+        El path efectivamente escrito.
+
+    POR QUÉ `model_dump()` y no `model_dump_json()`:
+    `json.dumps` sobre una lista de dicts es más simple de testear (el
+    resultado es texto plano, no bytes) y mantiene el control del indent.
+    `ensure_ascii=False` importa: los prompts contienen acentos y comillas
+    tipográficas; sin esto el JSON los escapa como \\uXXXX, sigue siendo
+    válido pero ilegible para un revisor humano.
+    """
+    payload = [call.model_dump() for call in results]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path

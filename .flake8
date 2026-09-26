@@ -1,3 +1,6 @@
 [flake8]
 max-line-length = 120
-extend-exclude = .venv,llm_sdk
+# `moulinette` es el código del EVALUADOR (la herramienta que nos califica),
+# no código nuestro. No lo linteamos: sus errores no son nuestros y el
+# subject dice que se evalúa solo el trabajo del repositorio del alumno.
+extend-exclude = .venv,llm_sdk,moulinette

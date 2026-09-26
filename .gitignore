@@ -31,6 +31,17 @@ data/output/
 # AI assistant context (local only — no es parte de la submission del subject VIII)
 CLAUDE.md
 
+# La moulinette es el CÓDIGO DEL EVALUADOR (la herramienta que nos califica),
+# no trabajo nuestro. El peer review la ejecuta desde su propia copia: si la
+# versionamos en nuestro repo aparece como código de un tercero dentro de la
+# entrega y la planilla dice que sólo se evalúa el trabajo del alumno.
+#
+# Queda en disco para poder correrla localmente, pero fuera del track.
+# OJO: esto NO alcanza para el lint — `flake8 .` y `mypy .` recorren el working
+# tree y NO respetan .gitignore, por eso .flake8 y pyproject.toml también la
+# excluyen explícitamente.
+moulinette/
+
 # Scratch y backups del refactor (fueron commiteados por error; quedan en disco, fuera del track)
 .scratch_task42/
 .refactor_backup_mario_validation/

@@ -20,11 +20,19 @@ class FunctionCall(BaseModel):
 
     Este modelo representa la SALIDA del sistema: lo que el decoder
     restringido va a producir por cada prompt y que después se serializa a
-    function_calls.json. Al modelarlo con pydantic ganamos gratis:
-    - validación al construir (si el generador produce basura, explota acá)
+    function_calling_results.json. Al modelarlo con pydantic ganamos gratis:
+    - validación al construir (si el generador produce basura, explode acá)
     - serialización a dict/JSON con .model_dump() / .model_dump_json()
+
+    ORDEN DE LOS CAMPOS: importa solo por legibilidad del JSON resultante
+    (pydantic serializa en orden de declaración), no semánticamente — el
+    orden de keys en un objeto JSON es irrelevante para `json.load`. El
+    orden prompt → name → parameters replica el ejemplo del subject (V.4.1).
     """
 
+    prompt: str = Field(
+        description="Original natural-language request, verbatim from the input file"
+    )
     name: str = Field(description="Name of the function to call")
 
     # ¿Por qué default_factory=dict y NO parameters: dict = {}? Porque los

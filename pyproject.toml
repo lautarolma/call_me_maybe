@@ -39,9 +39,12 @@ python_version = "3.10"
 ignore_missing_imports = true
 # llm_sdk is a provided third-party package with no type stubs, and tests/
 # are not graded by the subject — exclude both from direct checking (analogous
-# to .flake8's extend-exclude). The override below additionally stops mypy from
-# following llm_sdk's imports from src/.
-exclude = "(llm_sdk/|tests/)"
+# to .flake8's extend-exclude). `moulinette/` is the GRADER's own code that
+# ships inside the repo root: it is not ours, it has no stubs, and the subject
+# evaluates only the student's work, so it must not be type-checked either.
+# The override below additionally stops mypy from following llm_sdk's imports
+# from src/.
+exclude = "(llm_sdk/|tests/|moulinette/)"
 
 [[tool.mypy.overrides]]
 # llm_sdk ships no type stubs; treat it as Any instead of resolving it as a

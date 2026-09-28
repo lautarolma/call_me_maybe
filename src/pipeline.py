@@ -11,7 +11,12 @@ from pathlib import Path
 
 from src.models.output import FunctionCall
 from src.prompt.prompt_builder import build_prompt
-from src.utils.metrics import measure_time, track_prompt
+from src.utils.metrics import (
+    MetricsRun,
+    measure_time,
+    report_prompt_metrics,
+    track_prompt,
+)
 from src.decoder.constrained_generator import generate
 from src.decoder.trie import build_trie
 from src.validator import build_results
@@ -117,10 +122,31 @@ def run(args: argparse.Namespace) -> int:
     # generación queda libre de prints y mediciones directas (eso vive en
     # src/utils/metrics.py).
     generated: list[str] = []
+    # Un MetricsRun POR PROMPT, no uno acumulado: el conteo de forwards es la
+    # única magnitud que NO depende del hardware, así que es la que permite
+    # separar "el código hizo más trabajo" de "la máquina estuvo más lenta"
+    # (ver report_prompt_metrics). El loop sigue sin prints: sólo acumula.
+    prompt_metrics: list[MetricsRun] = []
     with measure_time("Prueba completa"):
         for i, prompt in enumerate(prompts):
             with track_prompt(i):
-                generated.append(generate(model, prompt, vocab, functions, trie_node)[0])
+                prompt_run = MetricsRun()
+                generated.append(
+                    generate(
+                        model,
+                        prompt,
+                        vocab,
+                        functions,
+                        trie_node,
+                        metrics=prompt_run,
+                    )[0]
+                )
+                prompt_metrics.append(prompt_run)
+
+    # El conteo de forwards vive en data/output/ (git-ignored, junto al
+    # entregable) y NO en /tmp: la evidencia de medición tiene que sobrevivir
+    # al reinicio de la VM.
+    report_prompt_metrics(prompt_metrics, args.output.parent / "decode_metrics.json")
 
     for i, result in enumerate(generated):
         print(f"  result : {result}")

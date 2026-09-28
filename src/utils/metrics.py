@@ -15,6 +15,7 @@ how benchmarks capture per-phase generation metrics.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,7 +25,13 @@ from typing import Iterator
 from src.decoder.state import DecoderPhase
 from src.utils.timer import measure_time
 
-__all__ = ["measure_time", "track_prompt", "PhaseMetrics", "MetricsRun"]
+__all__ = [
+    "measure_time",
+    "track_prompt",
+    "report_prompt_metrics",
+    "PhaseMetrics",
+    "MetricsRun",
+]
 
 
 @dataclass
@@ -134,3 +141,76 @@ def track_prompt(index: int) -> Iterator[None]:
     finally:
         elapsed_ms = (perf_counter() - start) * 1000.0
         print(f"[Timming] Prompt {index}: {elapsed_ms} ms")
+
+
+def report_prompt_metrics(
+    runs: Sequence[MetricsRun], out_path: Path | None = None
+) -> None:
+    """Imprime y persiste el conteo de forwards POR PROMPT.
+
+    POR QUÉ UN `MetricsRun` POR PROMPT y no uno acumulado: el conteo de
+    forwards es la ÚNICA magnitud de la decodificación que NO depende del
+    hardware. No hay KV-cache, así que un forward es "re-alimentar la
+    secuencia completa", y *cuántas* veces hay que hacerlo lo decide la
+    gramática (estado + oráculo + filtro), no la CPU. Por eso comparar ese
+    número entre dos corridas es lo que separa las dos hipótesis que
+    comparten síntoma:
+
+        forwards IGUALES  →  el código hizo el mismo trabajo y el tiempo
+                            extra es AMBIENTE (compilación, thermal, stole).
+        forwards DISTINTOS → el código cambió el trabajo; hay que optimizar.
+
+    La columna `s/fwd` es la contraparte: si sube con el mismo conteo de
+    forwards, la máquina estuvo más lenta por cada operación.
+
+    ⚠️ POR QUÉ NO REUSA `MetricsRun.report()`: ese método fija
+    `warm_up_discarded: True`, que describe el protocolo de benchmark (se
+    descarta una pasada de warm-up). El pipeline NO descarta ninguna, así que
+    escribir ese `true` en el JSON sería un dato falso en la evidencia.
+
+    Args:
+        runs: Un `MetricsRun` por prompt, en el orden en que se corrieron.
+        out_path: Si se pasa, escribe el mismo desglose como JSON.
+    """
+    print()
+    print("=== Per-prompt decode metrics ===")
+    print(f"  {'#':>3}  {'forwards':>8}  {'skips':>6}  {'elapsed(s)':>10}  {'s/fwd':>6}")
+
+    per_prompt: list[dict[str, object]] = []
+    for index, prompt_run in enumerate(runs):
+        totals = prompt_run.totals()
+        forwards = int(totals["total_forwards"])
+        elapsed_s = float(totals["elapsed_time_ms"]) / 1000.0
+        # Sin forwards el cociente no existe (todo oráculo/M5): se muestra
+        # como n/a en vez de dividir por cero y reventar la corrida.
+        s_per_fwd = f"{elapsed_s / forwards:>6.2f}" if forwards else f"{'n/a':>6}"
+        print(
+            f"  {index:>3}  {forwards:>8}  {int(totals['skips_if_single']):>6}"
+            f"  {elapsed_s:>10.2f}  {s_per_fwd}"
+        )
+        per_prompt.append(
+            {
+                "index": index,
+                "total_forwards": forwards,
+                "skips_if_single": int(totals["skips_if_single"]),
+                "elapsed_time_ms": float(totals["elapsed_time_ms"]),
+                "phases": prompt_run.to_dict(),
+            }
+        )
+
+    total_forwards = sum(int(r.totals()["total_forwards"]) for r in runs)
+    total_ms = sum(float(r.totals()["elapsed_time_ms"]) for r in runs)
+    total_s_per_fwd = f"{total_ms / total_forwards / 1000.0:>6.2f}" if total_forwards else "    n/a"
+    print(f"  {'ALL':>3}  {total_forwards:>8}  {'':>6}  {total_ms / 1000.0:>10.2f}  {total_s_per_fwd}")
+
+    if out_path is not None:
+        payload = {
+            "per_prompt": per_prompt,
+            "totals": {
+                "total_forwards": total_forwards,
+                "elapsed_time_ms": round(total_ms, 3),
+            },
+        }
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        print(f"  wrote decode metrics -> {out_path}")

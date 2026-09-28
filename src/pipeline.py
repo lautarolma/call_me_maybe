@@ -7,6 +7,7 @@ result and persists the output JSON required by the subject (V.4).
 
 from __future__ import annotations
 import json
+import sys
 from pathlib import Path
 
 from src.models.output import FunctionCall
@@ -19,7 +20,7 @@ from src.utils.metrics import (
 )
 from src.decoder.constrained_generator import generate
 from src.decoder.trie import build_trie
-from src.validator import build_results
+from src.validator import build_results, find_unsupported_prompts
 
 import argparse
 
@@ -157,6 +158,21 @@ def run(args: argparse.Namespace) -> int:
     # `build_results` conserva el orden 1:1 con los prompts de entrada: la
     # moulinette empareja con `zip()`, que es posicional.
     results: list[FunctionCall] = build_results(raw_prompts, generated)
+
+    # --- Diagnóstico de prompts sin match (stderr, nunca el JSON) ----------
+    # El decoder restringido siempre emite una función válida, así que un
+    # prompt que no corresponde a ninguna no crashea: elige la que menos feo
+    # queda y sigue. Sin este aviso el output parece correcto. No altera el
+    # archivo de resultados ni el score — es un sensor para quien lee la
+    # corrida. Ver `find_unsupported_prompts` para el criterio.
+    for idx in find_unsupported_prompts(raw_prompts, results):
+        print(
+            f"WARNING: prompt {idx} produced a call with no argument value "
+            f"present in the prompt text — the request most likely matches "
+            f"none of the available functions: {raw_prompts[idx]!r}",
+            file=sys.stderr,
+        )
+
     written = write_results(results, args.output)
 
     print()

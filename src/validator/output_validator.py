@@ -189,3 +189,89 @@ def build_results(
                 file=sys.stderr,
             )
     return results
+
+
+def _text_forms(value: object) -> list[str]:
+    """Representaciones textuales con las que un valor puede estar en un prompt.
+
+    POR QUÉ MÁS DE UNA FORMA: el decoder escribe los floats con punto decimal
+    (`2.0`), pero el humano escribe el número sin él ("sum 2 and 3"). Si sólo
+    aceptáramos `"2.0"` como evidencia de soporte, ese prompt legítimo
+    dispararía un warning falso. Por eso un float entero devuelve las dos
+    formas.
+
+    Devuelve `[]` para valores sin forma textual comparable (bool, None) —
+    el caller los trata como "no juzgables" en vez de "no soportados".
+    """
+    if isinstance(value, bool):
+        # `bool` es subclase de `int`: hay que chequearlo ANTES que int o
+        # True se reportaría como "1".
+        return []
+    if isinstance(value, int):
+        return [str(value)]
+    if isinstance(value, float):
+        forms = [repr(value)]
+        if value.is_integer():
+            forms.append(str(int(value)))
+        return forms
+    if isinstance(value, str):
+        return [value]
+    return []
+
+
+def find_unsupported_prompts(
+    prompts: list[str],
+    results: list[FunctionCall],
+) -> list[int]:
+    """Índices de los prompts cuya llamada no tiene NINGÚN valor respaldado
+    por el texto del prompt.
+
+    QUÉ HACE: el decoder restringido SIEMPRE emite una función válida — la
+    gramática no permite otra cosa. Para un prompt que no corresponde a
+    ninguna función, eso degenera en que el modelo elige la que "menos feo"
+    queda: no crashea, pero tampoco avisa. Ejemplo real medido:
+    *"What is the weather in Paris tomorrow?"* → `fn_get_square_root(a=100.0)`.
+    Esto detecta ese caso y lo reporta.
+
+    EL CRITERIO, y por qué es simple a propósito: si NINGÚN valor de
+    parámetro aparece (literal, sin distinguir mayúsculas) en el prompt, la
+    llamada no está respaldada por la entrada — el modelo se inventó hasta los
+    argumentos. Con que UNO aparezca, no se reporta: el caso borderline
+    (P9, donde `replacement="****"` no está en el prompt pero `source_string`
+    y `regex` sí) es un fallo de accuracy del modelo, no una falta de match,
+    y el corretero ya lo mide.
+
+    LO QUE ESTE MÓDULO **NO** ES — importante para la corrección del subject:
+    el subject dice que "the function to call should be chosen using the LLM,
+    not with heuristics". Acá NO se elige nada: la función ya la eligió el LLM
+    en constrained decoding. Esta función es un sensor de SALIDA para una
+    persona, no una decisión. No toca el archivo de resultados y no altera el
+    score.
+
+    Args:
+        prompts: Requests originales (texto crudo, sin las defs inyectadas).
+        results: Entries ya construidas por `build_results`.
+
+    Returns:
+        Índices (base 0) de los prompts sin respaldo textual. Vacío = todo OK.
+    """
+    unsupported: list[int] = []
+    for i, call in enumerate(results):
+        # El sentinel ya tiene su propio warning (no parseable) y no tiene
+        # argumentos que juzgar. Las funciones sin parámetros tampoco son
+        # juzgables: no hay con qué comparar contra el prompt.
+        if call.name == _UNKNOWN_FN_SENTINEL or not call.parameters:
+            continue
+        if i >= len(prompts):
+            continue
+        haystack = prompts[i].casefold()
+        if not haystack.strip():
+            continue
+        supported = any(
+            form and form.casefold() in haystack
+            for value in call.parameters.values()
+            for form in _text_forms(value)
+        )
+        if not supported:
+            unsupported.append(i)
+    return unsupported

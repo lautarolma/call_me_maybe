@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from src.decoder.schema_validator import SchemaContext
 from src.decoder.state import DecoderState
+from src.decoder.trie import TrieNode, build_trie
 from src.models.function_definition import FunctionDef, ParameterDef
 
 # Replica de data/input/functions_definition.json (subset usado en tests).
@@ -238,3 +239,154 @@ class TestEndToEnd:
         assert schema.can_close_params()
         step(schema, state, "}")  # '}' final del output object
         assert state.phase.name == "COMPLETE"
+
+
+#: Réplica de `fn_is_even` (definición PRIVADA de la moulinette):
+#: `{"n": {"type": "integer"}}`. Es el caso que rompía el decoder.
+INTEGER_FUNCTIONS = [
+    FunctionDef(
+        name="fn_is_even",
+        description="Check if a number is even.",
+        parameters={"n": ParameterDef(type="integer")},
+        returns={"type": "boolean"},
+    ),
+]
+
+
+class TestIntegerParamIsNumeric:
+    """REGRESIÓN del P0: un parámetro "integer" DEBE aceptar tokens numéricos.
+
+    CONTEXTO DEL BUG (por qué esta clase existe):
+    "integer" no es un tipo de JSON: es el de la moulinette para "int de
+    Python", y sólo aparece en las definiciones PRIVADAS
+    (`fn_is_even.n`, `fn_calculate_compound_interest.years`).
+
+    La cláusula 3 comparaba `kind == param.type` con IGUALDAD. Todo token
+    numérico declara kind "number" (_PHASE_KIND / _VALUE_START_KINDS), así que
+    con igualdad un "integer" declarado rechazaba CADA token candidato: el
+    allowed set quedaba vacío y el decoder se colgaba sin generar nada.
+
+    ⚠️ Estos tests usan `SchemaContext.allows_token`, NO el helper `step()` de
+    arriba. `step()` sólo camina la state machine (sintaxis) y por eso NUNCA
+    tocó la cláusula de tipo: la cobertura de `allows_token` era CERO, que es
+    exactamente por lo que el bug sobrevivió a 196 tests verdes. El tipo se
+    decide en la cláusula 3, que sólo se consulta al filtrar candidatos.
+    """
+
+    def _at_param_start(self) -> tuple[SchemaContext, DecoderState, TrieNode]:
+        """Estado real justo después del ':' que abre el valor de "n"."""
+        schema = SchemaContext(INTEGER_FUNCTIONS)
+        state = DecoderState()
+        step(schema, state, '{"name": "fn_is_even", "parameters": {"n":')
+        trie = build_trie([f.name for f in INTEGER_FUNCTIONS])
+        return schema, state, trie
+
+    def test_integer_param_accepts_digit(self) -> None:
+        """El token '1' tiene kind "number" y DEBE ser válido para "integer"."""
+        schema, state, trie = self._at_param_start()
+        ok, new_state = state.simulate("1")
+        assert ok, "1 es sintaxis válida"
+        assert schema.allows_token("1", new_state, trie), (
+            "un 'integer' declarado debe aceptar un dígito: con kind==type "
+            "ningún token numérico pasaba y el decoder no tenía candidatos"
+        )
+
+    def test_integer_param_accepts_negative(self) -> None:
+        """'-' también es kind "number": los negativos no deben quedar colgados."""
+        schema, state, trie = self._at_param_start()
+        ok, new_state = state.simulate("-")
+        assert ok
+        assert schema.allows_token("-", new_state, trie)
+
+    def test_integer_param_rejects_decimal_point(self) -> None:
+        """Cláusula 5: un "integer" NO admite '.', aunque JSON lo permita.
+
+        ⚠ Este test invertía su propia premisa ("JSON no distingue int de
+        float"). Para el SPEC es cierto, pero el evaluador no es un validador
+        de JSON: ejecuta `fn_is_even(n=2.5)` y revienta con
+        `assert isinstance(n, int)`. La syntacticidad la valida state.py; que
+        el LITERAL tenga forma de int es una regla de capa semántica
+        (SchemaContext), y por eso vive acá y no en el gramático.
+        """
+        schema, state, trie = self._at_param_start()
+        ok, new_state = state.simulate("2.5")
+        assert ok, "la sintaxis de '2.5' es JSON válido: el reject es del schema"
+        assert not schema.allows_token("2.5", new_state, trie), (
+            "un 'integer' no puede materializarse como float: la moulinette "
+            "corre assert isinstance(n, int) sobre el valor parseado"
+        )
+
+    def test_integer_param_rejects_exponent(self) -> None:
+        """idem con notación exponencial: '1e3' parsea a float en Python."""
+        schema, state, trie = self._at_param_start()
+        ok, new_state = state.simulate("1e3")
+        assert ok
+        assert not schema.allows_token("1e3", new_state, trie), (
+            "1e3 es un float de Python aunque se escriba sin punto"
+        )
+
+    def test_number_param_accepts_decimal_point(self) -> None:
+        """Contracara: un "number" SÍ debe admitir la forma float (2.5)."""
+        schema = SchemaContext(FUNCTIONS)  # fn_add_numbers.a: number
+        state = DecoderState()
+        step(schema, state, '{"name": "fn_add_numbers", "parameters": {"a":')
+        trie = build_trie([f.name for f in FUNCTIONS])
+        ok, new_state = state.simulate("2.5")
+        assert ok
+        assert schema.allows_token("2.5", new_state, trie), (
+            "la cláusula 5 sólo restringe a 'integer': no debe cerrar el "
+            "camino float de un 'number'"
+        )
+
+    def test_integer_param_rejects_string(self) -> None:
+        """Relajar el eje numérico NO abre la puerta a strings."""
+        schema, state, trie = self._at_param_start()
+        ok, new_state = state.simulate('"hola"')
+        assert ok, "la sintaxis del string es válida"
+        assert not schema.allows_token('"hola"', new_state, trie), (
+            "un string no puede satisfacer un parámetro 'integer'"
+        )
+
+    def test_integer_param_rejects_boolean(self) -> None:
+        """idem con boolean: kind 'boolean' no pertenece a la familia numérica."""
+        schema, state, trie = self._at_param_start()
+        ok, new_state = state.simulate("true")
+        assert ok
+        assert not schema.allows_token("true", new_state, trie)
+
+    def test_integer_param_rejects_null(self) -> None:
+        """idem con null."""
+        schema, state, trie = self._at_param_start()
+        ok, new_state = state.simulate("null")
+        assert ok
+        assert not schema.allows_token("null", new_state, trie)
+
+    def test_integer_param_walks_to_complete(self) -> None:
+        """Camina el JSON completo: el fix no sólo permite el token, termina."""
+        schema = SchemaContext(INTEGER_FUNCTIONS)
+        state = DecoderState()
+        step(schema, state, '{"name": "fn_is_even", "parameters": {"n": 4')
+        step(schema, state, "}")
+        step(schema, state, "}")
+        assert schema.all_required_present()
+        assert state.phase.name == "COMPLETE"
+
+    def test_number_still_rejects_boolean(self) -> None:
+        """Guarda contra regresión: relajar 'integer' tampoco relajó 'number'."""
+        schema = SchemaContext(FUNCTIONS)
+        state = DecoderState()
+        step(schema, state, '{"name": "fn_add_numbers", "parameters": {"a":')
+        trie = build_trie([f.name for f in FUNCTIONS])
+        ok, new_state = state.simulate("false")
+        assert ok
+        assert not schema.allows_token("false", new_state, trie)
+
+    def test_number_param_accepts_digit(self) -> None:
+        """Guarda contra regresión: 'number' sigue aceptando dígitos."""
+        schema = SchemaContext(FUNCTIONS)
+        state = DecoderState()
+        step(schema, state, '{"name": "fn_add_numbers", "parameters": {"a":')
+        trie = build_trie([f.name for f in FUNCTIONS])
+        ok, new_state = state.simulate("1")
+        assert ok
+        assert schema.allows_token("1", new_state, trie)

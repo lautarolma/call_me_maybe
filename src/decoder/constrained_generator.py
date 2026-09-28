@@ -420,6 +420,10 @@ def generate(
                     token_text = vocab.id2decoded.get(single_id)
                     if token_text is None:
                         break
+                    _inject_float_tail(
+                        state, schema, token_text, model, vocab,
+                        input_ids, emitted_parts,
+                    )
                     input_ids.append(single_id)
                     if not state.update_from_text(token_text):
                         break
@@ -450,6 +454,12 @@ def generate(
                 # Ningún candidato de allowed pasó el pase fino.
                 break
 
+            # Un "number" que cierra como entero ('2,') se completa a '2.0'
+            # ANTES de commitear el cierre elegido (sin forward extra).
+            _inject_float_tail(
+                state, schema, token_text, model, vocab, input_ids, emitted_parts
+            )
+
             input_ids.append(best_id)
 
             # ⚠ DESVÍO del plan (ver docstring del módulo): se commitea con
@@ -479,6 +489,61 @@ def generate(
     generated = model.decode(generated_ids)
 
     return generated, state.phase is DecoderPhase.COMPLETE
+
+
+_NUMBER_CLOSERS = frozenset(_WS + ",}")
+
+
+def _inject_float_tail(
+    state: DecoderState,
+    schema: SchemaContext,
+    token_text: str,
+    model: Small_LLM_Model,
+    vocab: Vocab,
+    input_ids: list[int],
+    emitted_parts: list[str],
+) -> bool:
+    """Completa a float un "number" que el modelo está por cerrar como entero.
+
+    ⚠ POR QUÉ ES UN HELPER Y NO UN if EN EL LOOP: el decoder tiene DOS paths
+    de commit — el ambiguo (argmax sobre `allowed`) y el M5 skip-if-single
+    (`len(allowed) == 1`). Ambos pueden commitear el token de cierre, así que
+    si la regla viviera en uno solo, el invariante "un 'number' siempre cierra
+    como float" dependería del path por el que pasó el token. Con
+    `state.expected_first_chars()` en IN_NUMBER_VALUE no hay comodín '*'
+    (`_number_next_chars` devuelve chars literales), así que el guard del M5
+    SÍ se cumple ahí: el hueco es alcanzable, no teórico.
+
+    Returns True si inyectó (el estado avanzó); False si no aplicaba.
+    """
+    tail = _float_tail(state, schema, token_text)
+    if tail is None:
+        return False
+    return _inject_static_header(
+        tail, model, vocab, input_ids, state, schema, emitted_parts
+    )
+
+
+def _float_tail(
+    state: DecoderState, schema: SchemaContext, token_text: str
+) -> str | None:
+    """'.0' si ``token_text`` cierra un literal entero de un parámetro "number".
+
+    La moulinette exige `isinstance(a, float)` para "number": `2` da 0
+    puntos, `2.0` pasa. Solo dispara cuando el modelo YA eligió cerrar (el
+    token arranca con terminador) y el buffer es un entero puro (sin '.' ni
+    exponente), así que un `2.5` o `0.0375` nunca se toca y el valor numérico
+    no cambia. Un "integer" no entra: su expected type es "integer".
+    """
+    if state.phase is not DecoderPhase.IN_NUMBER_VALUE or state.depth != 1:
+        return None
+    if schema.current_expected_type() != "number":
+        return None
+    if not token_text or token_text[0] not in _NUMBER_CLOSERS:
+        return None
+    if not state.number_buffer.lstrip("-").isdigit():
+        return None
+    return ".0"
 
 
 def _inject_static_header(

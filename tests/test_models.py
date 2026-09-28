@@ -37,9 +37,31 @@ class TestFunctionDef:
         assert fn.parameters["b"].name == "b"
 
     def test_invalid_parameter_type_raises(self) -> None:
-        payload = {**VALID_FUNCTION, "parameters": {"a": {"type": "integer"}}}
+        # "object" es un tipo REAL de JSON, pero está fuera del scope del MVP a
+        # propósito (requiere schema recursivo — ver bonus B8). Sigue siendo el
+        # mejor ejemplo de tipo inválido porque el rechazo es INTENCIONAL y no
+        # un olvido.
+        #
+        # OJO: este test usaba "integer" como ejemplo y POR ESO codificaba un
+        # bug como comportamiento esperado. "integer" no es un tipo de JSON:
+        # es la manera que tiene la moulinette de marcar un int de Python, y
+        # aparece en las definiciones privadas. Con "integer" fuera del Literal,
+        # load_functions explotaba sobre el set privado y el programa no
+        # arrancaba. Ver test_integer_type_accepted.
+        payload = {**VALID_FUNCTION, "parameters": {"a": {"type": "object"}}}
         with pytest.raises(ValidationError):
             FunctionDef(**payload)
+
+    def test_integer_type_accepted(self) -> None:
+        """Regresión del P0: "integer" es un tipo válido (sólo en el set privado).
+
+        Si este test falla, el programa no arranca con las definiciones privadas
+        (`fn_is_even.n` y `fn_calculate_compound_interest.years` son
+        "integer") y la mitad de la evaluación queda en cero.
+        """
+        payload = {**VALID_FUNCTION, "parameters": {"a": {"type": "integer"}}}
+        fn = FunctionDef(**payload)
+        assert fn.parameters["a"].type == "integer"
 
     def test_non_string_parameter_type_raises(self) -> None:
         payload = {**VALID_FUNCTION, "parameters": {"a": {"type": 123}}}
@@ -47,7 +69,7 @@ class TestFunctionDef:
             FunctionDef(**payload)
 
     def test_all_documented_types_accepted(self) -> None:
-        for allowed in ("string", "number", "boolean", "null"):
+        for allowed in ("string", "number", "integer", "boolean", "null"):
             payload = {**VALID_FUNCTION, "parameters": {"x": {"type": allowed}}}
             fn = FunctionDef(**payload)
             assert fn.parameters["x"].type == allowed

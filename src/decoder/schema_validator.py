@@ -93,6 +93,52 @@ _VALUE_START_KINDS: dict[str, str] = {
     "n": "null",
 }
 
+# Tipos PARÁMETRO que el decoder trata como numéricos.
+#
+# ⭐ LA REGLA: JSON tiene UN SOLO tipo numérico — "integer" no existe en el
+# spec. Es la manera que tiene la moulinette de decir "este parámetro es un int
+# de Python" (extract_functions_infos.TYPE_MAP: int→"integer", float→"number"),
+# y aparece en las definiciones PRIVADAS (`fn_is_even.n`,
+# `fn_calculate_compound_interest.years`).
+#
+# Por lo tanto un literal numérico (`2`, `2.0`, `-1e3`) es SINTÁCTICAMENTE
+# válido para los dos tipos declarados, y la cláusula 3 solo chequea la
+# FAMILIA. La FORMA del literal (int vs float de Python) la imponen dos piezas
+# aparte: la cláusula 5 (`_allows_integer_form`) prohíbe '.', 'e' y 'E' en un
+# "integer", y el generator inyecta '.0' cuando un "number" cierra como entero.
+# No se puede dejar a la frontera de salida: `4.5` para un integer no tiene
+# cast válido, y `2` vs `2.0` son secuencias de tokens distintas.
+#
+# Confundir esas dos capas es lo que hace que un `==` directo sea un bug: todo
+# token numérico declara kind "number" (ver _PHASE_KIND y _VALUE_START_KINDS),
+# así que con igualdad un parámetro declarado "integer" rechazaría CADA token
+# candidato → allowed set vacío → el decoder se cuelga.
+_NUMERIC_PARAM_TYPES = frozenset({"number", "integer"})
+
+
+def _declared_type_accepts(kind: str, declared: str) -> bool:
+    """¿Un token de kind `kind` es válido para un parámetro declarado `declared`?
+
+    Sustituye al `kind == declared` directo de la cláusula 3 para que los tipos
+    numéricos se traten como UNA familia:
+
+        _declared_type_accepts("number", "number")   -> True
+        _declared_type_accepts("number", "integer")  -> True   <- el fix de P0
+        _declared_type_accepts("string", "number")   -> False
+        _declared_type_accepts("number", "string")   -> False
+        _declared_type_accepts("boolean", "number")  -> False
+
+    Sólo se relaja el eje numérico: acá los dos aceptan la familia numérica.
+    La forma exacta del literal para "integer" la restringe la cláusula 5.
+    """
+    if kind == "number":
+        return declared in _NUMERIC_PARAM_TYPES
+    return kind == declared
+
+
+#: Terminadores de un literal numérico: cierran el value en curso.
+_NUMBER_TERMINATORS = frozenset(",} \t\n\r")
+
 
 class SchemaContext:
     """Estado semántico del decoder: función seleccionada + contexto de params.
@@ -217,11 +263,12 @@ class SchemaContext:
           cada candidato en Fase 3; acá SOLO se lee el snapshot commiteado del
           último update(state) (self._phase/_current_key/_depth/_keys_enclosed)
           + el estado SIMULADO new_state que el filter acaba de producir.
-        - CUATRO cláusulas ANDed, cada una con su trigger:
+        - CINCO cláusulas ANDed, cada una con su trigger:
             1. _allows_name_value  → trie contra el value de "name"
             2. _allows_param_key   → keys del objeto parameters (depth 1)
             3. _allows_value_type  → tipo del value de un parámetro
             4. _allows_params_close→ el '}' de cierre de parameters
+            5. _allows_integer_form→ un "integer" no admite '.', 'e', 'E'
         - El parámetro token_text (firma del plan) lo usa SOLO la cláusula de
           tipo (primer char de un value que abre Y cierra en el mismo token).
           El resto trabaja con fases y buffers: justamente el punto del
@@ -253,6 +300,8 @@ class SchemaContext:
         if not self._allows_value_type(token_text, new_state):
             return False
         if not self._allows_params_close(new_state):
+            return False
+        if not self._allows_integer_form(token_text):
             return False
         return True
 
@@ -428,7 +477,42 @@ class SchemaContext:
         param = self.selected_function.parameters.get(new_state.current_key)
         if param is None:
             return True  # key sin tipo conocido: default allow
-        return kind == param.type
+        # Compatibilidad y NO igualdad: "integer" es un tipo de la moulinette,
+        # no de JSON, así que un token numérico lo satisface igual que a
+        # "number". Con `kind == param.type` un parámetro declarado "integer"
+        # (que sólo existe en el set privado) rechazaría todos los tokens
+        # candidatos y el decoder quedaría sin nada que generar.
+        return _declared_type_accepts(kind, param.type)
+
+    def _allows_integer_form(self, token_text: str) -> bool:
+        """Cláusula 5: el literal de un parámetro "integer" no lleva '.', 'e' ni 'E'.
+
+        La moulinette ejecuta `fn(**params)` con `assert isinstance(n, int)`:
+        `4.0` o `1e3` (floats en Python) dan 0 puntos aunque sean JSON válido.
+
+        Trigger por estado COMMITEADO: el token arranca en COLON (puede abrir
+        el value) o dentro de IN_NUMBER_VALUE (lo continúa), a depth 1 y con
+        el parámetro declarado "integer". Solo se inspecta el tramo del token
+        previo al primer terminador: lo que viene después ya no es del literal.
+        """
+        if self._phase not in (DecoderPhase.COLON, DecoderPhase.IN_NUMBER_VALUE):
+            return True
+        if self._depth != 1 or self.selected_function is None:
+            return True
+        param = self.selected_function.parameters.get(self._current_key)
+        if param is None or param.type != "integer":
+            return True
+        text = token_text
+        if self._phase is DecoderPhase.COLON:
+            text = token_text.lstrip()
+            if not text or text[0] not in "-0123456789":
+                return True  # el token no abre un number
+        for char in text:
+            if char in _NUMBER_TERMINATORS:
+                break
+            if char in ".eE":
+                return False
+        return True
 
     def _allows_params_close(self, new_state: DecoderState) -> bool:
         """Cláusula 4: el '}' de cierre de parameters exige los required.

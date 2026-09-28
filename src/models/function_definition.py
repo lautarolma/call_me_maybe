@@ -13,14 +13,28 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 #: Allowed JSON types for function parameters.
-#: Solo los 4 tipos ESCALARES de JSON entran en el MVP. Los compuestos
+#: Solo los tipos ESCALARES de JSON entran en el MVP. Los compuestos
 #: (objects/dicts y arrays) quedan FUERA del scope del proyecto a propósito:
 #: validar y hacer constrained decoding de un parámetro anidado requiere una
 #: máquina de estados + schema recursivo mucho más complejo.
 #: ⭐ BONUS B8 ("complex nested function arguments"): para habilitarlo, agregar
 #: "object" y "array" a este Literal y extender FunctionDef/schema_validator
 #: para manejar tipos anidados. NO tocar hasta que el MVP esté verde.
-ParameterType = Literal["string", "number", "boolean", "null"]
+#:
+#: ⚠️ POR QUÉ "integer" ESTÁ ACÁ Y NO ES UN TIPO DE JSON (no lo borres):
+#: "integer" NO existe en el spec de JSON — hay UN solo tipo numérico. Es una
+#: distinción de la MOULINETTE (extract_functions_infos.TYPE_MAP mapea
+#: `int` → "integer" y `float` → "number"), y aparece en las definiciones
+#: PRIVADAS (`fn_is_even.n`, `fn_calculate_compound_interest.years`).
+#: Sin este Literal, `load_functions` explota con `literal_error` sobre el
+#: set privado y el programa NO ARRANCA: 0 en la mitad de la evaluación.
+#: Ojo con el efecto dominó: aceitar el Literal NO alcanza. El decoder compara
+#: el tipo declarado contra el kind del token (schema_validator.
+#: `_allows_value_type`) y todo token numérico declara kind "number"; con
+#: `==` un "integer" declarado haría que NINGÚN token fuera válido → cuelgue
+#: en vez de crash. Por eso el decoder tiene que comparar por COMPATIBILIDAD
+#: (`_declared_type_accepts`), no por igualdad. Ver schema_validator.py.
+ParameterType = Literal["string", "number", "integer", "boolean", "null"]
 
 
 class ParameterDef(BaseModel):
@@ -52,7 +66,11 @@ class ParameterDef(BaseModel):
     # default, la validación fallaría antes de llegar al sincronizador.
     name: str = Field(default="", description="Parameter name")
     type: ParameterType = Field(
-        description="Parameter type: 'string', 'number', 'boolean', 'null'"
+        description=(
+            "Parameter type: 'string', 'number', 'integer', 'boolean', 'null'. "
+            "'integer' is not a JSON type: it is the moulinette's spelling for "
+            "'this parameter is a Python int' (see ParameterType)"
+        )
     )
 
 

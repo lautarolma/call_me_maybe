@@ -26,6 +26,8 @@ VOLUNTAD DE ESTOS TESTS (por dentro):
 from __future__ import annotations
 
 from src.decoder.constrained_generator import (
+    _float_tail,
+    _inject_float_tail,
     _inject_static_header,
     _next_static_text,
     _passes_fine_validation,
@@ -793,3 +795,156 @@ class TestOracleEndToEnd:
         # probe_fn_empty 24/09): T6 aporta el '\n}' que cerró el ROOT.
         assert generated.endswith('"fn_empty", "parameters": {}\n}')
         assert model.calls == 7  # 5 name + '{'+'}' de parameters (T6 gratis)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# number == float: la otra mitad del fix (la que NO es SchemaContext)
+# ─────────────────────────────────────────────────────────────────────────
+
+#: Definición PRIVADA que mezcla number e integer en la MISMA llamada: es
+#: donde un fix laxo se delata (si el decimal se acepta para cualquiera de los
+#: dos, el `isinstance` de la moulinette revienta).
+MIXED_FUNCTIONS = [
+    FunctionDef(
+        name="fn_calc",
+        description="Compute compound interest.",
+        parameters={
+            "principal": ParameterDef(type="number"),
+            "years": ParameterDef(type="integer"),
+        },
+        returns={"type": "number"},
+    ),
+]
+
+#: Id sintético para ".0" (el vocab mock compartido no lo trae y NO se toca:
+#: agregarlo al VOCAB global cambiaría `starting["."]` y
+#: `valid_by_phase` para todos los tests de pase fino).
+TAIL_ID = 200
+
+
+class FloatTailModel:
+    """Fake que sólo sabe tokenizar el tail ".0" (lo que inyecta el fix)."""
+
+    def __init__(self, vocab: Vocab) -> None:
+        self._vocab = vocab
+        # Patch local del vocab de ESTE test (el mock es por-test).
+        vocab.id2decoded[TAIL_ID] = ".0"
+        vocab.id2token[TAIL_ID] = ".0"
+        vocab.token2id[".0"] = TAIL_ID
+        vocab.tokens_starting_with.setdefault(".", set()).add(TAIL_ID)
+
+    def encode(self, text: str) -> _FakeTensor:
+        if text == ".0":
+            return _FakeTensor([TAIL_ID])
+        return _FakeTensor([999])
+
+
+def _at_number(
+    key: str, buffer: str, functions: list[FunctionDef] = MIXED_FUNCTIONS
+) -> tuple[DecoderState, SchemaContext]:
+    """Estado real en IN_NUMBER_VALUE con ``buffer`` ya commiteado en el param."""
+    state = DecoderState()
+    schema = SchemaContext(functions)
+    prefix = (
+        "{", '"name": ', '"', functions[0].name, '"',
+        ', "parameters": {', f'"{key}":', buffer,
+    )
+    for t in prefix:
+        step(state, schema, t)
+    assert state.phase is DecoderPhase.IN_NUMBER_VALUE, state.phase
+    return state, schema
+
+
+class TestFloatTailTrigger:
+    """`_float_tail` devuelve '.0' SÓLO cuando hay que volver float un integer.
+
+    POR QUÉ EXISTE ESTA MITAD: la moulinette corre `assert isinstance(a, float)`
+    para un parámetro "number" — `2` da 0 puntos. No se puede dejar la
+    corrección a la frontera de salida (output_validator) porque `2` y `2.0` son
+    SECUENCIAS DE TOKENS DISTINTAS: el decoder ya las emitió, y '2.0' != '2' es
+    un string distinto. La forma del literal tiene que garantizarse durante la
+    decodificación; el DÓNDE (SchemaContext para `integer`, generator para
+    `number`) lo fija la arquitectura, no el capricho.
+    """
+
+    def test_fires_on_comma_closer(self) -> None:
+        state, schema = _at_number("principal", "2")
+        assert _float_tail(state, schema, ",") == ".0"
+
+    def test_fires_on_brace_closer(self) -> None:
+        state, schema = _at_number("principal", "2")
+        assert _float_tail(state, schema, "}") == ".0"
+
+    def test_fires_on_whitespace_closer(self) -> None:
+        """El ws es terminador válido: '2 }' también cierra el valor."""
+        state, schema = _at_number("principal", "2")
+        assert _float_tail(state, schema, " }") == ".0"
+
+    def test_fires_on_negative_integer(self) -> None:
+        state, schema = _at_number("principal", "-7")
+        assert _float_tail(state, schema, ",") == ".0"
+
+    def test_injection_lands_before_the_closer(self) -> None:
+        """End-to-end del helper: tras inyectar, el buffer es un float y el
+        estado SIGUE en IN_NUMBER_VALUE, listo para recibir el cierre."""
+        vocab = build_vocab()
+        state, schema = _at_number("principal", "2")
+        ids: list[int] = []
+        emitted: list[str] = []
+        model = FloatTailModel(vocab)
+        assert _inject_float_tail(state, schema, ",", model, vocab, ids, emitted)
+        assert state.number_buffer == "2.0", state.number_buffer
+        assert state.phase is DecoderPhase.IN_NUMBER_VALUE
+        assert emitted == [".0"], emitted
+        # Recién ahora el cierre es válido (antes, "2," no cerraba un float).
+        assert state.update_from_text(",")
+
+
+class TestFloatTailNoTrigger:
+    """Todo lo que NO debe disparar la inyección.
+
+    Cada caso es un modo de fallo propio: si alguno disparara, estaríamos
+    CORRIENDO un valor (2.5 -> 2.5.0) o tocando un parámetro que no
+    corresponde.
+    """
+
+    def test_no_trigger_on_integer_param(self) -> None:
+        """Un "integer" NO se toca: coercionar 4 a 4.0 rompe el assert."""
+        state, schema = _at_number("years", "4")
+        assert _float_tail(state, schema, ",") is None
+
+    def test_no_trigger_when_fraction_already_present(self) -> None:
+        """'2.5' ya es float: inyectar produciría '2.5.0' (JSON inválido)."""
+        state, schema = _at_number("principal", "2.5")
+        assert _float_tail(state, schema, ",") is None
+
+    def test_no_trigger_on_exponent(self) -> None:
+        """'1e3' es un float de Python: no le falta nada."""
+        state, schema = _at_number("principal", "1e3")
+        assert _float_tail(state, schema, ",") is None
+
+    def test_no_trigger_on_digit_continuation(self) -> None:
+        """Sólo dispara al CERRAR. Un token que sigue el número no cierra."""
+        state, schema = _at_number("principal", "2")
+        assert _float_tail(state, schema, "5") is None
+        assert _float_tail(state, schema, ".") is None
+
+    def test_no_trigger_after_number_closed(self) -> None:
+        """Fuera de IN_NUMBER_VALUE no hay literal que completar."""
+        state, schema = _at_number("principal", "2")
+        step(state, schema, ",")
+        assert state.phase is not DecoderPhase.IN_NUMBER_VALUE
+        assert _float_tail(state, schema, "}") is None
+
+    def test_no_trigger_at_depth_zero_name(self) -> None:
+        """El value de "name" es depth 0 y su tipo esperado es string.
+
+        Aunque la grammar no lo sepa y acepte `{"name": 2`, el expected type
+        NO es "number" → nada que completar.
+        """
+        state = DecoderState()
+        schema = SchemaContext(MIXED_FUNCTIONS)
+        for t in ("{", '"name": ', "2"):
+            step(state, schema, t)
+        assert state.phase is DecoderPhase.IN_NUMBER_VALUE
+        assert _float_tail(state, schema, ",") is None

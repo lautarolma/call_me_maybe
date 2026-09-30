@@ -28,7 +28,7 @@ from __future__ import annotations
 from src.decoder.constrained_generator import (
     _float_tail,
     _inject_float_tail,
-    _inject_static_header,
+    _commit_static_text,
     _next_static_text,
     _passes_fine_validation,
     generate,
@@ -686,7 +686,7 @@ class TailFakeModel(FakeModel):
 
 
 class TestInjectOracleText:
-    """_inject_static_header con un canónico del oráculo: el estado post
+    """_commit_static_text con un canónico del oráculo: el estado post
     debe coincidir EXACTO con state.simulate(C) (fuente de verdad — dec.
     25/09; una tabla escrita a mano desincronizada con state.py sería un
     bug silencioso)."""
@@ -699,7 +699,7 @@ class TestInjectOracleText:
         model = TailFakeModel(vocab, [])
         ids: list[int] = []
         emitted: list[str] = []
-        assert _inject_static_header(
+        assert _commit_static_text(
             T1_CANON_ADD, model, vocab, ids, state, schema, emitted
         )
         assert ids == _ORACLE_IDS[T1_CANON_ADD]
@@ -716,7 +716,7 @@ class TestInjectOracleText:
         step(state, schema, ', "b": 3')
         model = TailFakeModel(vocab, [])
         ids: list[int] = []
-        assert _inject_static_header(T5_CANON, model, vocab, ids, state, schema)
+        assert _commit_static_text(T5_CANON, model, vocab, ids, state, schema)
         _ok, sim = state.simulate(T5_CANON)
         assert self._state_tuple(state) == self._state_tuple(sim)
         assert state.phase is DecoderPhase.COMPLETE
@@ -730,7 +730,7 @@ class TestInjectOracleText:
         model = FakeModel(vocab, [])
         ids: list[int] = []
         before = (state.phase, state.depth, state.current_key)
-        assert not _inject_static_header(
+        assert not _commit_static_text(
             _OLD_TAIL, model, vocab, ids, state, schema
         )
         assert not ids

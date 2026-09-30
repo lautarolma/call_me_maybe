@@ -1,5 +1,27 @@
 """Constrained generator (Task 4.1): el loop de generación.
 
+CÓMO LEER ESTE MÓDULO (lo primero que conviene entender):
+- generate() es el bucle. Todo lo demás son helpers, están más abajo en el
+  archivo en orden inverso de uso: primero lo que el bucle llama al final.
+- Cada step del bucle recorre TRES caminos, en este orden, y gana el primero
+  que aplica:
+    1. TRAMO ESTÁTICO (sin forward). Si el estado actual matchea un texto
+       determinista — el header Opt2 al arrancar, o el tail al cerrar — se
+       inyecta YA tokenizado. Es el camino más barato: no consulta al modelo.
+    2. M5 SKIP-IF-SINGLE (sin forward). Si no hay wildcard y el filtro
+       completo devuelve exactamente 1 candidato, no hay decisión que tomar:
+       se commitea sin gastar un forward.
+    3. M1/M2 CON FORWARD. Se consulta al modelo y se elige por argmax sobre
+       los candidatos válidos, con pase fino (Inciso 4.1.1, más abajo).
+- INVARIANTE ESTRUCTURAL: cada uno de los 3 caminos tiene exactamente UN
+  punto de commit, y los 3 usan la misma secuencia de 4 operaciones:
+      input_ids.append(id) → state.update_from_text(text) → schema.update(state)
+      → emitted_parts.append(text)
+  Son 3 caminos y 3 sitios de commit, uno a uno. Eso NO es casualidad: si
+  agregás un camino nuevo, tenés que agregarle su commit, y si a un commit
+  nuevo le olvidás la fila de emitted_parts, el paso fino y el tramo estático
+  van a ver un output incompleto (es exactamente lo que pasó en BUG-012).
+
 POR QUÉ EXISTE ESTE MÓDULO (por dentro):
 - Es la cinta transportadora del plan didáctico: por cada step toma los
   logits del modelo, los filtra a los ids que mantienen el output como JSON
@@ -9,7 +31,7 @@ POR QUÉ EXISTE ESTE MÓDULO (por dentro):
   los ~151K ids del vocab a un set pequeño; acá vive el argmax que la firma
   del filter tenía reservado (el filter NO consume logits).
 
-INCISO 4.1.1 — PASO FINO POST-ARgMAX (corrección documentada en el plan):
+INCISO 4.1.1 — PASO FINO POST-ARGMAX (corrección documentada en el plan):
 - Los gaps de las cláusulas del schema (documentados en sus docstrings) son
   abstención por no-coincidencia de bordes pre/post: el filter valida el
   token como un TODO (snapshot commiteado + snapshot simulado), no el
@@ -25,6 +47,13 @@ INCISO 4.1.1 — PASO FINO POST-ARgMAX (corrección documentada en el plan):
 - Si el ganador no pasa el pase fino, se descarta y se prueba el SIGUIENTE
   mejor de allowed (argmax repetido). Normalmente el primero pasa (~1
   re-simulación por step); el peor caso es degradación controlada.
+  OJO — esto depende de qué rama del filter produjo `allowed` (ver
+  _pick_best_token): con M2 (top-k del modelo) hay hasta 2000 alternativas y
+  el reintento tiene dónde elegir; con M1 (el argmax crudo, fast path) `allowed`
+  trae un único elemento, así que si ese uno falla el pase fino no hay
+  alternativa y el veto aplica. Hoy el veto de M1 no se ha observado en la
+  suite, pero la rama sigue abierta por diseño (M1 existe para no validar
+  nada extra cuando la decisión ya está tomada).
 - Cierra además el gap del plan "output object sin parameters": cuando el
   estado llega a COMPLETE, el pase fino exige que el recorrido haya pasado
   por PARAMS_OBJECT (SchemaContext.has_seen_params_object). El subject V.4.1
@@ -604,13 +633,34 @@ def _pick_best_token(
     vocab: Vocab,
     trie: TrieNode,
 ) -> tuple[int | None, str]:
-    """Argmax sobre allowed, con pase fino del ganador (Inciso 4.1.1).
+    """Argmax restringido a `allowed`, con pase fino y reintento (4.1.1).
 
-    CÓMO FUNCIONA (por dentro):
-    - `max(allowed, key=lambda tid: logits[tid])` = argmax restringido al
-      set permitido: el token con logit más alto que el modelo prefiere.
-    - Si el ganador NO pasa _passes_fine_validation(), se descarta del set
-      y se elige el siguiente mejor. Devolver (None, "") = allowed agotado.
+    QUÉ HACE (por dentro):
+    - Elige el token de `allowed` con el logit más alto (argmax restringido:
+      el mejor token que el modelo prefiere DENTRO de lo permitido). Si pasa
+      el pase fino, lo devuelve.
+    - Si NO pasa, lo saca del set y repite con el siguiente mejor. El bucle
+      termina de dos formas: encontramos un token que pasa el pase fino, o
+      se agotó `allowed` y no hay candidatos válidos → devuelve (None, "").
+
+    LA TRAMPA — el reintento sólo tiene adónde ir si `allowed` traía más de
+    un elemento, y eso depende de qué rama del filter produjo el set:
+    - M2 (top-k del modelo): hasta 2000 candidatos → el reintento tiene
+      alternativas de verdad y puede rescatar la generación.
+    - M1 (el argmax crudo, fast path): 1 solo candidato → si ese falla el pase
+      fino, el bucle agota el set en una vuelta y devuelve el veto. No es un
+      bug: es que M1 existe para no validar nada cuando la decisión ya está
+      tomada, y su costo es que no deja plan B. Por eso el filtro acumula
+      (no corta) en M2, y por eso la asimetría es deliberada.
+
+    INVARIANTE que hace seguro el bucle: _passes_fine_validation() NO muta
+    ni `state` ni `schema` — copia el estado y valida sobre un SchemaContext
+    fresco. Si los contaminara, el primer candidato fallido dejaría el
+    contexto corrupto y los siguientes intentos validarían sobre basura.
+
+    EFECTO SECUNDARIO: este bucle consume `allowed` (lo va descartando). Quien
+    lo llama no debe volver a usar ese set después — si lo necesita intacto,
+    que pase una copia.
     """
     while allowed:
         best_id = max(allowed, key=lambda tid: logits[tid])

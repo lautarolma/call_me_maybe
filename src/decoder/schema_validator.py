@@ -263,16 +263,28 @@ class SchemaContext:
           cada candidato en Fase 3; acá SOLO se lee el snapshot commiteado del
           último update(state) (self._phase/_current_key/_depth/_keys_enclosed)
           + el estado SIMULADO new_state que el filter acaba de producir.
-        - CINCO cláusulas ANDed, cada una con su trigger:
-            1. _allows_name_value  → trie contra el value de "name"
-            2. _allows_param_key   → keys del objeto parameters (depth 1)
-            3. _allows_value_type  → tipo del value de un parámetro
-            4. _allows_params_close→ el '}' de cierre de parameters
-            5. _allows_integer_form→ un "integer" no admite '.', 'e', 'E'
-        - El parámetro token_text (firma del plan) lo usa SOLO la cláusula de
-          tipo (primer char de un value que abre Y cierra en el mismo token).
-          El resto trabaja con fases y buffers: justamente el punto del
-          desvío name_buffer (Task 3.3) — el schema no necesita re-parsear.
+        - CINCO cláusulas ANDed. Para leerlas de un vistazo:
+            1. _allows_name_value   → el value de "name" tiene que ser un
+               nombre de función del trie. Trigga en la fase del name.
+               BLOQUEA: un value que no matchea ninguna función.
+            2. _allows_param_key    → las keys de "parameters" existen en el
+               schema y no están repetidas. Trigga por CAMBIO del texto de
+               la key. BLOQUEA: key inexistente o duplicada.
+            3. _allows_value_type   → el value de un parámetro tiene que
+               coincidir con el tipo declarado. Trigga cuando el token ABRE
+               un value en depth 1. BLOQUEA: un string donde se espera
+               number, un number donde se espera string.
+            4. _allows_params_close → el '}' que cierra "parameters" solo si
+               ya están todas las keys requeridas. Trigga por el salto de
+               depth 1 → 0. BLOQUEA: cerrar con required faltantes.
+            5. _allows_integer_form → un parámetro declarado "integer" no
+               admite '.', 'e' ni 'E'. Trigga en COLON o dentro de
+               IN_NUMBER_VALUE. BLOQUEA: 4.0 o 1e3 donde la moulinette
+               hace assert isinstance(n, int).
+        - El parámetro token_text (firma del plan) lo usan SOLO las cláusulas
+          3 y 5 (primer char de un value que abre Y cierra en el mismo
+          token). El resto trabaja con fases y buffers: justamente el punto
+          del desvío name_buffer (Task 3.3) — el schema no re-parsea.
 
         GAPS (scope del plan, deliberados):
         - El '}' de cierre del OUTPUT object (depth 0 → COMPLETE) NO se gatea
@@ -285,6 +297,16 @@ class SchemaContext:
         - Values anidados (depth >= 2) escapan a estas cláusulas: el plan solo
           modela parámetros escalares de UN nivel (B8 futuro). La state
           machine ni siquiera sensa bien el depth a partir de 2.
+        - El CONTENIDO de un value "string" no está restringido en absoluto.
+          La cláusula 3 sabe que la fase es IN_STRING_VALUE y que el tipo
+          declarado es "string", así que la comprobación se cumple y sigue:
+          nunca mira los caracteres de adentro. Consecuencia medible: durante
+          la generación del value de un parámetro tipo string, las cinco
+          cláusulas abstienen y el contenido sale por argmax libre sobre el
+          vocabulario completo. Es correcto por diseño — el schema declara
+          el TIPO, no un formato ni un patrón — pero conviene saberlo: no hay
+          ninguna red detrás de lo que el modelo escriba dentro de un string,
+          y no la puede haber sin parsear el valor.
         - Un ESCAPE dentro del value de "name" NO queda bloqueado por el
           trie "por construcción" (BUG-011): los escapes se skippean del
           buffer en state.py, así que name_buffer no cambia y el prefijo

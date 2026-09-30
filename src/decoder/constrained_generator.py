@@ -13,14 +13,14 @@ CÓMO LEER ESTE MÓDULO (lo primero que conviene entender):
        se commitea sin gastar un forward.
     3. M1/M2 CON FORWARD. Se consulta al modelo y se elige por argmax sobre
        los candidatos válidos, con pase fino (Inciso 4.1.1, más abajo).
-- INVARIANTE ESTRUCTURAL: cada uno de los 3 caminos tiene exactamente UN
-  punto de commit, y los 3 usan la misma secuencia de 4 operaciones:
+- INVARIANTE ESTRUCTURAL: los 3 caminos terminan en UN commit cada uno, y
+  ese commit es la misma secuencia de 4 operaciones:
       input_ids.append(id) → state.update_from_text(text) → schema.update(state)
       → emitted_parts.append(text)
-  Son 3 caminos y 3 sitios de commit, uno a uno. Eso NO es casualidad: si
-  agregás un camino nuevo, tenés que agregarle su commit, y si a un commit
-  nuevo le olvidás la fila de emitted_parts, el paso fino y el tramo estático
-  van a ver un output incompleto (es exactamente lo que pasó en BUG-012).
+  Esa secuencia vive encapsulada en _commit_token(), no replicada inline. Si
+  se replicara por camino, un commit nuevo al que se le olvidara la fila de
+  emitted_parts haría que el pase fino y el tramo estático del oráculo
+  vieran un output incompleto — es exactamente lo que pasó en BUG-012.
 
 POR QUÉ EXISTE ESTE MÓDULO (por dentro):
 - Es la cinta transportadora del plan didáctico: por cada step toma los

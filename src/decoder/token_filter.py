@@ -93,6 +93,43 @@ def compute_allowed_ids(
 
     Returns:
         set de ids cuyo texto decodificado mantiene el output válido.
+        OJO: la cantidad de elementos depende de si se pasaron logits, y esa
+        diferencia es deliberada (ver "DOS CONTRATOS DE RETORNO" abajo).
+
+    DOS CONTRATOS DE RETORNO — hay que entenderlo para no leer mal el
+    resultado:
+
+    1. CON logits (camino caliente, el 99% de los steps): se valida solo el
+       top-k del modelo y se devuelven los válidos de ESE top-k (1..top_k
+       elementos). Los tokens fuera del top-k no se miraron: no es "el
+       conjunto de todos los tokens válidos", es "el subconjunto de
+       válidos que el modelo ya quería usar". La ventaja es que en cada step
+       sólo se simulan ~2000 candidatos en vez de ~151K.
+    2. SIN logits (skip-if-single, camino frío): se valida el vocabulario
+       entero y se devuelve el conjunto completo de válidos. Se usa
+       únicamente cuando hace falta saber si el conjunto es de tamaño
+       exactamente 1.
+
+    La consecuencia práctica (y la trampa): el generador sólo necesita un
+    SEGUNDO token cuando el primero falla el pase fino. Por eso el camino
+    caliente se alcanza a proteger con un solo candidato, pero el frío puede
+    devolver decenas y ese segundo candidato es el que salva una generación que
+    el pase fino iba a cortar.
+
+    M1 y M2 no devuelven lo mismo a propósito:
+    - M1 (el token que el modelo quiere, sin maskear) devuelve como máximo 1
+      candidato. Es el fast path: si el argmax sobrevive al pase fino, ya
+      está, y no se validó nada más. Coste: cero validaciones extra.
+    - M2 (el top-k del modelo) devuelve TODOS los válidos de los primeros
+      2000, stopping en el primer tier que produjo alguno. Acumula en vez de
+      cortar en el primer válido, para que el pase fino tenga alternativas
+      reales entre las que elegir.
+
+    OJO con la asimetría que deja esto: si M1 gana (el argmax sobrevive al
+    filtro) pero el pase fino lo rechaza igual, no hay segundo candidato y
+    el veto se aplica. Con M2 no pasa: hay hasta 2000 alternativas. Es una
+    decisión de performance, no un olvido — M1 existe para no validar nada
+    cuando la decisión ya está tomada.
 
     CÓMO FUNCIONA (por dentro):
     - Fase 1: junta los buckets del pre-índice para los chars esperados. Si
@@ -151,7 +188,8 @@ def compute_allowed_ids(
 
         # M2: Top-K Masking con escalonamiento por tiers.
         # En vez de validar K candidatos de golpe, se validan por tandas
-        # crecientes. Se retorna en cuanto un candidato pasa.
+        # crecientes. Se devuelve el PRIMER TIER que produjo algún válido, y
+        # ese tier COMPLETO (no solo el primer válido del tier).
         import heapq
         # Pre-sort: los top_k IDs de mayor logit, en orden descendente.
         ranked_ids = heapq.nlargest(
@@ -161,10 +199,29 @@ def compute_allowed_ids(
         # matchean el bucket.
         ranked_ids = [tid for tid in ranked_ids if tid in candidate_ids]
 
-        # Escalonamiento: validar por tiers hasta encontrar uno que pase.
+        # Escalonamiento: validar por tiers hasta que uno produzca candidatos.
+        #
+        # ⚠ POR QUÉ EL TIER COMPLETO Y NO EL PRIMER VÁLIDO (fix 2026-09-30):
+        # esta función devolvía {el primer válido} → un singleton SIEMPRE. El
+        # pase fino del generator (`_pick_best_token`) está diseñado para
+        # descartar al mejor y PROBAR EL SIGUIENTE, pero con un solo candidato
+        # no había siguiente: su `while allowed:` itera exactamente una vez y
+        # `generate()` corta la generación (output truncado, ok=False). Eso
+        # era un veto, no un filtro — y el Inciso 4.1.1, que existe para
+        # cubrir los tokens que cruzan dos puntos de validación de una vez
+        # (residuales R1/R2/R3 de schema_validator), no podía cumplir su
+        # función. Devolver el tier completo le da al pase fino los
+        # alternativos que el diseño siempre presupuso.
+        #
+        # NO cambia la Candidatura: el tier se detiene en el primero que produce
+        # algo, así que el caso promedio (el top-1 del tier 1 es válido)
+        # devuelve un singleton igual que antes. Solo se agregan candidatos
+        # cuando el tier tenía MÁS de un válido, que es exactamente cuando
+        # hacen falta.
         checked = 0
         for tier_size in TIER_SIZES:
             end = min(checked + tier_size, len(ranked_ids))
+            passing: set[int] = set()
             for idx in range(checked, end):
                 token_id = ranked_ids[idx]
                 decoded = vocab.id2decoded.get(token_id)
@@ -174,8 +231,10 @@ def compute_allowed_ids(
                 if not valid:
                     continue
                 if schema.allows_token(decoded, new_state, trie):
-                    return {token_id}
+                    passing.add(token_id)
             checked = end
+            if passing:
+                return passing
             if checked >= len(ranked_ids):
                 break
 

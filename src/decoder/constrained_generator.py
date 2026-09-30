@@ -453,11 +453,11 @@ def generate(
                         state, schema, token_text, model, vocab,
                         input_ids, emitted_parts,
                     )
-                    input_ids.append(single_id)
-                    if not state.update_from_text(token_text):
+                    if not _commit_token(
+                        single_id, token_text, state, schema,
+                        input_ids, emitted_parts,
+                    ):
                         break
-                    schema.update(state)
-                    emitted_parts.append(token_text)
                     if state.phase is DecoderPhase.COMPLETE:
                         break
                     continue
@@ -489,17 +489,15 @@ def generate(
                 state, schema, token_text, model, vocab, input_ids, emitted_parts
             )
 
-            input_ids.append(best_id)
-
             # ⚠ DESVÍO del plan (ver docstring del módulo): se commitea con
             # el texto DECODIFICADO, el mismo que vio la state machine en
-            # simulate().
-            if not state.update_from_text(token_text):
-                # No debería pasar: el filter ya validó este token en Fase 2.
-                # Defensivo: si ocurriera, el estado queda atómico.
+            # simulate(). Las 4 operaciones van juntas en _commit_token: si
+            # update_from_text fallara (no debería, el filter ya validó este
+            # token en Fase 2) el loop corta y el estado queda atómico.
+            if not _commit_token(
+                best_id, token_text, state, schema, input_ids, emitted_parts
+            ):
                 break
-            schema.update(state)
-            emitted_parts.append(token_text)
 
             if state.phase is DecoderPhase.COMPLETE:
                 break
@@ -518,6 +516,45 @@ def generate(
     generated = model.decode(generated_ids)
 
     return generated, state.phase is DecoderPhase.COMPLETE
+
+
+def _commit_token(
+    token_id: int,
+    token_text: str,
+    state: DecoderState,
+    schema: SchemaContext,
+    input_ids: list[int],
+    emitted_parts: list[str],
+) -> bool:
+    """Commitea UN token generado: las 4 operaciones, siempre juntas.
+
+    POR QUÉ EXISTE (por dentro):
+    - El bucle tiene 2 caminos que committean un token elegido por el filtro
+      (M5 skip-if-single y M1/M2). Los dos necesitan SIEMPRE la misma
+      secuencia: sumar el id, avanzar la state machine, sincronizar el schema
+      con el estado nuevo, y recién ahí acumular el texto en emitted_parts.
+    - emitted_parts es lo que usan el pase fino (Inciso 4.1.1) y el tramo
+      estático del oráculo para ver el output ya emitido. Si un camino se
+      olvidara de la última fila, ambos verían un output incompleto y el
+      resultado se rompería de forma silenciosa (fue BUG-012). Por eso la
+      secuencia vive acá, en un solo lugar, y no replicada en cada commit.
+    - ORDEN INVARIABLE: el id se suma a input_ids ANTES de avanzar la state.
+      Si update_from_text rechazara el texto (no debería: el filter ya lo
+      validó), el caller corta el loop. Ojo: en ese caso input_ids ya quedó
+      con el id adelantado mientras state y emitted_parts no — el "estado
+      atómico" del que hablan los comentarios se refiere a state/schema, no a
+      input_ids. Es una rama defensiva, no el camino normal.
+
+    Returns:
+        True si el token quedó commiteado; False si update_from_text lo
+        rechazó (el caller debe cortar el loop).
+    """
+    input_ids.append(token_id)
+    if not state.update_from_text(token_text):
+        return False
+    schema.update(state)
+    emitted_parts.append(token_text)
+    return True
 
 
 _NUMBER_CLOSERS = frozenset(_WS + ",}")

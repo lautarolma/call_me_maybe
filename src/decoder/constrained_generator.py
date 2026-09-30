@@ -93,7 +93,7 @@ MAX_TOKENS = 200  # Safety net — el output esperado es ~30-60 tokens
 # determinista por el schema — TODO output válido arranca con esta
 # estructura antes de que el LLM tenga que elegir el nombre real de la
 # función. Se tokeniza UNA vez con encode() y se inyecta sin forward ni
-# filtro (ver _inject_static_header): recorta los forwards estructurales
+# filtro (ver _commit_static_text): recorta los forwards estructurales
 # de ROOT/OBJECT_OPEN/KEY_START/IN_KEY/KEY_END/COLON medidos en el Anexo
 # (~8-11 por prompt, ~4.5-4.8s cada uno — el costo del forward() del
 # modelo es uniforme por step, no depende del tamaño del candidate set,
@@ -411,7 +411,7 @@ def generate(
     # (header, oráculo, M5 y forward) — nunca se resetea ni se deriva de
     # estructuras aparte.
     emitted_parts: list[str] = []
-    _inject_static_header(
+    _commit_static_text(
         STATIC_HEADER, model, vocab, input_ids, state, schema, emitted_parts
     )
 
@@ -426,7 +426,7 @@ def generate(
             # continue SOLO ocurre con avance real (sin eso, re-matchear el
             # mismo tramo en el step siguiente sería un loop infinito).
             tail = _next_static_text(state, schema, "".join(emitted_parts))
-            if tail is not None and _inject_static_header(
+            if tail is not None and _commit_static_text(
                 tail, model, vocab, input_ids, state, schema, emitted_parts
             ):
                 if state.phase is DecoderPhase.COMPLETE:
@@ -548,7 +548,7 @@ def _inject_float_tail(
     tail = _float_tail(state, schema, token_text)
     if tail is None:
         return False
-    return _inject_static_header(
+    return _commit_static_text(
         tail, model, vocab, input_ids, state, schema, emitted_parts
     )
 
@@ -575,8 +575,8 @@ def _float_tail(
     return ".0"
 
 
-def _inject_static_header(
-    header: str,
+def _commit_static_text(
+    text: str,
     model: Small_LLM_Model,
     vocab: Vocab,
     input_ids: list[int],
@@ -584,10 +584,17 @@ def _inject_static_header(
     schema: SchemaContext,
     emitted_parts: list[str] | None = None,
 ) -> bool:
-    """Precarga ``header`` en input_ids/state/schema sin llamar al modelo.
+    """Commitea texto estático ya tokenizado, sin llamar al modelo.
+
+    Despite el nombre viejo ("inject_static_header"), esto NO es solo el
+    header: es el ÚNICO punto de commit del camino estático, y por él pasan
+    tres textos distintos — el header Opt2 al arrancar, el tail de cierre al
+    terminar, y el sufijo float que _inject_float_tail le delega. Se llama
+    _commit_static_text porque lo que hace no es "inyectar un header" sino
+    "commitear una decisión del oráculo que no necesita consultar al modelo".
 
     CÓMO FUNCIONA (por dentro):
-    - `model.encode(header)` tokeniza el prefijo UNA vez; cada id resultante
+    - `model.encode(text)` tokeniza el prefijo UNA vez; cada id resultante
       se commitea con el mismo `state.update_from_text` del loop principal
       (mismo contrato: atómico, mueve la state machine char por char).
     - `emitted_parts` (opcional): cuando se pasa, cada decoded commitado se
@@ -610,9 +617,9 @@ def _inject_static_header(
         infinito. (El header 1 pre-loop ignora el retorno: se llama una
         sola vez, fuera del loop — no tiene ese riesgo.)
     """
-    header_ids = model.encode(header)[0].tolist()
+    static_ids = model.encode(text)[0].tolist()
     advanced = False
-    for token_id in header_ids:
+    for token_id in static_ids:
         decoded = vocab.id2decoded.get(token_id)
         if decoded is None or not state.update_from_text(decoded):
             break
@@ -663,7 +670,7 @@ def _pick_best_token(
     que pase una copia.
     """
     while allowed:
-        best_id = max(allowed, key=lambda tid: logits[tid])
+        best_id = max(allowed, key=logits.__getitem__)
         token_text = vocab.id2decoded.get(best_id)
         if token_text is not None and _passes_fine_validation(
             functions, schema, state, trie, token_text

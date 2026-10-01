@@ -59,6 +59,68 @@ def test_build_function_call_keeps_prompt_verbatim() -> None:
 
 
 # --------------------------------------------------------------------------
+# _snap_to_query_span — re-anclaje del value al tramo verbatim de la query
+# --------------------------------------------------------------------------
+def test_snap_restores_clipped_leading_punctuation() -> None:
+    """Test privado 8: el modelo copia el path pero pierde el '/' inicial."""
+    prompt = "Read the file at /home/user/data.json with utf-8 encoding"
+    payload = {"name": "fn_read_file", "parameters": {"path": "home/user/data.json", "encoding": "utf-8"}}
+    call = build_function_call(prompt, payload)
+    assert call.parameters["path"] == "/home/user/data.json"
+    assert call.parameters["encoding"] == "utf-8"  # ya arranca en borde: intacto
+
+
+def test_snap_leaves_windows_drive_path_untouched() -> None:
+    """Test privado 9: arranca con 'C', no con '/'. La regla NO fuerza '/'."""
+    prompt = "Read C:\\Users\\john\\config.ini with latin-1 encoding"
+    payload = {"name": "fn_read_file", "parameters": {"path": "C:\\Users\\john\\config.ini"}}
+    call = build_function_call(prompt, payload)
+    assert call.parameters["path"] == "C:\\Users\\john\\config.ini"
+
+
+def test_snap_stops_at_quote_delimiter() -> None:
+    """La comilla DELIMITA el valor: 'hello' no se estira a "'hello"."""
+    call = build_function_call(
+        "Reverse the string 'hello'",
+        {"name": "fn_reverse_string", "parameters": {"s": "hello"}},
+    )
+    assert call.parameters["s"] == "hello"
+
+
+def test_snap_stops_at_alphanumeric_suffix() -> None:
+    """'llo' dentro de 'hello' es un sufijo, no un valor clipeado."""
+    call = build_function_call(
+        "Give me the last 3 letters of 'hello'",
+        {"name": "fn_substring", "parameters": {"s": "llo"}},
+    )
+    assert call.parameters["s"] == "llo"
+
+
+def test_snap_leaves_value_absent_from_prompt() -> None:
+    """Sin ocurrencia verbatim no hay re-anclaje posible (P9: '****')."""
+    call = build_function_call(
+        "Replace all vowels with asterisks",
+        {"name": "fn_substitute_string_with_regex", "parameters": {"replacement": "****"}},
+    )
+    assert call.parameters["replacement"] == "****"
+
+
+def test_snap_ignores_non_string_values() -> None:
+    """Números/bools/null no pasan por el re-anclaje."""
+    call = build_function_call(
+        "What is the product of 3 and 5?",
+        {"name": "fn_multiply_numbers", "parameters": {"a": 3.0, "b": 5.0}},
+    )
+    assert call.parameters == {"a": 3.0, "b": 5.0}
+
+
+def test_snap_is_noop_with_empty_prompt() -> None:
+    """`validate_output` construye con prompt="" → no-op por diseño."""
+    call = build_function_call("", {"name": "fn_x", "parameters": {"s": "home/user"}})
+    assert call.parameters["s"] == "home/user"
+
+
+# --------------------------------------------------------------------------
 # validate_output
 # --------------------------------------------------------------------------
 def test_validate_output_reports_invalid_json_as_value() -> None:

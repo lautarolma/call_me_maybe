@@ -49,6 +49,12 @@ from src.models.output import FunctionCall
 # legible en el log de errores.
 _UNKNOWN_FN_SENTINEL = "__unparseable__"
 
+#: Delimitadores que marcan el borde IZQUIERDO de un valor copiado de la query.
+#: Whitespace y comillas separan palabras/valores en lenguaje natural. Un
+#: alfanumérico pegado a la izquierda significa que el valor es el SUFIJO de
+#: una palabra más larga ("llo" dentro de "hello") y NO se debe estirar.
+_SNAP_BOUNDARY = frozenset(" \t\n\r\"'")
+
 
 def parse_output(raw: str) -> dict[str, object]:
     """Parsea el string del decoder a un dict.
@@ -72,6 +78,56 @@ def parse_output(raw: str) -> dict[str, object]:
     return json.loads(raw.strip())  # type: ignore[no-any-return]
 
 
+def _snap_to_query_span(value: str, prompt: str) -> str:
+    """Re-ancla un valor string al tramo VERBATIM de la query del que salió.
+
+    QUÉ PROBLEMA RESUELVE (caso real medido, test privado 8):
+    el prompt dice ``Read the file at /home/user/data.json with utf-8`` y el
+    modelo emite ``path = "home/user/data.json"``: copia bien TODO el path
+    menos la puntuación líder (``/``). No alucina el contenido — clipea el
+    borde izquierdo del tramo que copió.
+
+    LA REGLA (tres pasos):
+    1. Si el valor aparece LITERALMENTE en la query (substring exacto),
+       ubica esa ocurrencia con ``find``.
+    2. Mira el char inmediatamente a la izquierda. Si es PUNTUACIÓN (no
+       whitespace, no comilla, no alfanumérico), ese char era parte del valor
+       y el modelo lo perdió: estirá el valor hacia la izquierda hasta el
+       primer borde.
+    3. Si ya arranca en un borde, o no aparece en la query, no toca nada.
+
+    POR QUÉ FRENA EN ESOS CHAR (contraejemplos que fijan la frontera):
+    - ``"llo"`` dentro de ``"hello"``: a la izquierda hay ``e`` (alfanumérico)
+      → NO se estira. Sin este freno, "las últimas 3 letras de hello"
+      devolvería "hello" entero.
+    - ``"hello"`` dentro de ``'hello'``: a la izquierda hay ``'`` (comilla) →
+      NO se estira. La comilla es el DELIMITADOR del valor, no su contenido:
+      sin este freno se rompían los tests públicos de ``'hello'``/``'world'``
+      (``hello`` → ``'hello``).
+    - ``"C:\\Users\\john\\config.ini"`` (test privado 9): a la izquierda hay
+      espacio → NO se estira. Por eso un path Windows (que no arranca con
+      ``/``) queda intacto: la regla NO asume "todo path empieza con /".
+
+    LÍMITE CONOCIDO: usa la PRIMERA ocurrencia (``find``). Si el mismo valor
+    aparece varias veces con bordes distintos, sólo considera la primera.
+    Ninguno de los 22 casos medidos (11 públicos + 11 privados) lo ejercita.
+    """
+    if not value:
+        return value
+    start = prompt.find(value)
+    if start < 0:
+        return value
+    left = start
+    while left > 0:
+        ch = prompt[left - 1]
+        if ch in _SNAP_BOUNDARY or ch.isalnum():
+            break
+        left -= 1
+    if left == start:
+        return value
+    return prompt[left:start + len(value)]
+
+
 def build_function_call(prompt: str, payload: dict[str, object]) -> FunctionCall:
     """Construye un FunctionCall validado desde (prompt, payload parseado).
 
@@ -90,6 +146,15 @@ def build_function_call(prompt: str, payload: dict[str, object]) -> FunctionCall
     """
     name = payload.get("name")
     parameters = payload.get("parameters", {})
+    raw_parameters = parameters if isinstance(parameters, dict) else {}
+    # Re-ancla cada value string a su tramo VERBATIM en la query: el modelo
+    # copia bien el contenido pero suele clipear la puntuación líder (ver
+    # `_snap_to_query_span`). Los no-string (números, bools, null) pasan
+    # intactos — el proyecto limita los params a escalares (models/output.py).
+    snapped_parameters = {
+        key: _snap_to_query_span(value, prompt) if isinstance(value, str) else value
+        for key, value in raw_parameters.items()
+    }
     return FunctionCall(
         prompt=prompt,
         # `name` viene como object del json.loads; pydantic lo valida como str.
@@ -97,10 +162,10 @@ def build_function_call(prompt: str, payload: dict[str, object]) -> FunctionCall
         # nunca falla en la práctica — pero sin él, mypy se quejaría de
         # pasar `object` donde se espera `str`.
         name=name if isinstance(name, str) else str(name),
-        # Mismo motivo: `parameters` es `object` para mypy, y el campo del
-        # modelo es `dict[str, JSONValue]`. El default {} cubre el caso
-        # "el decoder emitió solo el name" (fn sin parámetros).
-        parameters=parameters if isinstance(parameters, dict) else {},
+        # `raw_parameters` es `object` para mypy (viene de `payload`); el
+        # isinstance de arriba ya lo estrechó a dict. El default {} cubre el
+        # caso "el decoder emitió solo el name" (fn sin parámetros).
+        parameters=snapped_parameters,
     )
 
 

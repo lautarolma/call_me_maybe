@@ -2,7 +2,7 @@
 
 ---
 
-## Description
+## 📝 Description
 
 **call_me_maybe** is a constrained-decoding pipeline that turns free-form natural
 language into a single, structurally-valid JSON function call. It wraps a local
@@ -28,11 +28,12 @@ prompt.
 
 ---
 
-## Instructions
+## 🚀 Instructions
 
 Requires **Python 3.10+** and [`uv`](https://docs.astral.sh/uv/). The only
 runtime dependencies are `numpy` and `pydantic`; `llm_sdk` is vendored in this
-repository (permitted by the subject) and used as-is.
+repository (permitted by the subject) and used as-is.  
+
 
 ```bash
 # 1. install
@@ -44,8 +45,8 @@ make run              # == uv run python -m src
 # custom input/output files
 uv run python -m src \
     --functions_definition data/input/functions_definition.json \
-    --input              data/input/function_calling_tests.json \
-    --output             data/output/answer.json
+    --input               data/input/function_calling_tests.json \
+    --output              data/output/answer.json
 
 # tests + static checks (what the reviewer runs)
 make test             # pytest
@@ -59,7 +60,7 @@ time.
 
 ---
 
-## Algorithm explanation
+## 🧠 Algorithm explanation
 
 The decoder is a **finite-state machine + schema validator + trie**, driven by
 the model's logits. Generation is a loop; each step narrows the model's choice
@@ -78,7 +79,8 @@ on the path it would trace.
 ### 2. Schema validation (`src/decoder/schema_validator.py`)
 
 `SchemaContext.allows_token()` is the semantic layer. Five AND-ed clauses check
-the token against the selected function's signature:
+the token against the selected function's signature:  
+
 
 | # | Clause | Gates | Blocks |
 |---|--------|-------|--------|
@@ -146,9 +148,84 @@ input_ids.append(id) → state.update_from_text(text) → schema.update(state)
 been emitted; a commit that skipped its last row would leave them working on an
 incomplete view of the output.
 
+### The decode loop
+
+The loop repeats one idea: **before paying for a forward pass, ask whether the
+model is needed at all.** Each iteration walks the stages above and stops at the
+first question whose answer removes the model from the critical path.
+
+#### 0 · Inject the static header
+
+The output always opens the same way (`\n\n{\n  "name": "`), and the model has
+not been asked for it yet. It is encoded once and injected directly.
+
+> **Question:** *what must every valid output begin with?*
+> **Action:** encode the fixed prefix and commit it. No forward pass.
+
+#### 1 · Ask whether the state already determines the next text
+
+Once the function is chosen, large parts of the remaining output are forced: the
+indentation, the `"parameters": {` header, the argument keys in their declared
+order. The oracle holds a table of such spans, each keyed on the current FSM
+state.
+
+> **Question:** *does the current state match one of the deterministic spans?*
+> **Action:** if yes, inject that span pre-tokenized and go back to the loop —
+> no forward, no filtering. If the injection fails to advance the state, it falls
+> through to step 2 rather than looping forever on the same span.
+
+#### 2 · Ask whether only one token is legal
+
+For structural phases the valid candidate set is small (~10–100). Running the
+full filter on it is cheap, so the code does — and then checks the size.
+
+> **Question:** *is exactly one token valid here?*
+> **Action:** if yes, commit it. A unique valid token carries no information the
+> model could contradict, so the forward pass is pure waste.
+
+#### 3 · Consult the model, and narrow the vocabulary
+
+This is the only stage that calls `forward()`. The logits come back over the full
+~151k vocabulary, and the filter reduces them to the ids that keep the output
+valid (M1 validates the raw argmax alone; M2 validates the model's top-2000 as a
+set).
+
+> **Question:** *among the tokens that keep the output valid, which does the
+> model prefer?*
+> **Action:** pick the highest-logit id inside the allowed set.
+
+#### 4 · Re-simulate the winner before trusting it
+
+The per-token view of the FSM cannot see *inside* a token: a single BPE token can
+enter and leave a construct at once, and the intermediate character would go
+unread. So the winner is replayed character by character against a fresh
+`SchemaContext` before it is committed.
+
+> **Question:** *does the best candidate survive a character-by-character
+> replay?*
+> **Action:** if yes, commit. If no, **drop it and ask the same question again**
+> with the next-best candidate. With M2 there are up to 2000 alternatives to fall
+> back on; with M1 there is only one, so a failure there ends generation — a
+> deliberate asymmetry, since M1 exists to avoid validating anything extra once
+> the decision is already forced.
+
+#### 5 · Commit atomically
+
+Whichever token won, it is committed through the single 4-step sequence above, so
+every code path keeps the FSM, the schema and `emitted_parts` in agreement. A
+`"number"` about to close as an integer is completed to `2.0` here, before the
+commit. The loop ends when the FSM reaches `COMPLETE`.
+
+> **Question:** *has the FSM reached `COMPLETE`?*
+> **Action:** if yes, decode the generated ids and return the text. If no, return
+> to step 1.
+
+Of these six steps, **only step 3 calls the model.** Steps 1 and 2 remove whole
+forwards from the run, which is where most of the speedup comes from.
+
 ---
 
-## Design decisions
+## 💡 Design decisions
 
 - **Constrain structure, not the model.** The plan is to make invalid output
   *impossible to select*, not to ask nicely in a prompt. Grammar lives in the
@@ -170,12 +247,12 @@ incomplete view of the output.
 
 ---
 
-## Performance analysis
+## 📊 Performance analysis
 
 All numbers are from a clean run (no other load on the machine) on the 11-prompt
-public suite, model `Qwen/Qwen3-0.6B`, CPU-only build.
+input suite, model `Qwen/Qwen3-0.6B`, CPU-only build.
 
-### Latency — the optimization stages
+### ⏱️ Latency — the optimization stages
 
 The KPI was *11-prompt suite under 5 minutes* on real CPU. Starting from a naive
 "ask the model for everything", the strategy was to move deterministic work off
@@ -190,19 +267,31 @@ the model's critical path:
   State-keyed oracle (N1)          |    7.6 min|     133
   VM tuned (4 vCPU, exec cap 80)   |    4:53   |     133  <-- KPI met
   ------------------------------------------------------------------
+
+  ── optimization achieved (bar length = speedup vs the original) ──
+
+  VM tuned (4 vCPU, exec cap 80)   ████████████████████  7.2x   4:53    🚀
+  State-keyed oracle (N1)          █████████████        4.6x   7.6 min
+  Static header (Opt2)             ██████                2.3x   15.1 min
+  Pre-index refactor               ████                  1.3x   27.6 min
+  Original (all from the model)    ███                   1.0x   34.9 min
 ```
 
 **~7.2x faster and ~4.8x fewer forwards** than the original. The decisive lever
 was the oracle: it cut the structural forwards to zero, because by the time the
 function is known the punctuation is fully determined.
 
-### Accuracy
+> ⚠️ The last row was measured at 133 forwards. The accuracy fix that reaches
+> 10/11 adds ~4 forwards (137), so that stage is **pending a clean
+> re-measurement**; the optimization series above is otherwise unchanged.
+
+### 🎯 Accuracy
 
 | Metric | Result |
 |--------|--------|
-| Function name accuracy | 11/11 (100%) |
-| Full argument accuracy (real grader) | 10/11 (90.9%) |
-| JSON well-formedness | 100% (guaranteed by construction) |
+| 🎯 Function name accuracy | 11/11 (100%) |
+| ✅ Full argument accuracy (exact match on every argument) | 10/11 (90.9%) |
+| 🔒 JSON well-formedness | 100% (guaranteed by construction) |
 
 The one miss is a **model-capability limit, not a structural one**. For
 *"replace vowels with asterisks"* the model must map the English word
@@ -240,7 +329,7 @@ This ran entirely on CPU, inside a virtual machine:
 
 ---
 
-## Challenges faced
+## 🧗 Challenges faced
 
 - **A single BPE token can cross a structural boundary.** Validating tokens as
   opaque strings let tokens that entered *and* exited a construct slip through.
@@ -252,40 +341,46 @@ This ran entirely on CPU, inside a virtual machine:
 - **Escape sequences inside `"name"` weren't blocked by the trie** (BUG-011) —
   the guard was in the wrong layer, where the state never reached it. Moved into
   the FSM's string step, where the backslash is actually read.
-- **An output-integrity bug where the oracle's trigger matched on a stale
-  `current_key`** and re-injected `"parameters"` (BUG-013) — it produced corrupt
-  but `success=true` output. Fixed with a state-derived gate (N) whose domains
-  are disjoint by construction.
+- **Two genuinely different states read identically.** The static-injection
+  trigger keyed on `(phase, depth, current_key)`, and `fn_greet`'s inner
+  parameter is *also* called `name` — so the instant `parameters` closed, the
+  state was indistinguishable from the instant the top-level `"name"` value
+  closed. The oracle fired a second time mid-output, injecting a duplicate
+  `"parameters"` key that silently dropped an argument while the run still
+  reported success (BUG-013). The fix was not to clear the field but to add the
+  observable that separates the cases — `keys_enclosed == ∅` — so each trigger
+  owns a state domain no other can enter. Both *equivalent-looking* fixes were
+  unsafe: clearing `current_key` erases the legitimate reading, and the sticky
+  "already opened" flag it replaced is blind to a token carrying `{` inside it.
 - **The filter returned a single candidate, silently turning the fine pass's
   "try the next one" recovery into a hard veto** (BUG-014). The M2 branch now
   returns the whole valid tier.
-- **Misleading tooling misled earlier measurements.** Raw-logit "output screens"
-  showed valid JSON that the final grader disagreed with, and a micro-optimization
-  that looked fast in isolation proved *slower* under real conditions. Lesson
-  applied throughout: only the real grader and byte-level A/B comparisons are
-  trusted for decisions.
+- **A measurement that looked green was not.** A raw-logit preview showed
+  well-formed JSON that differed from the committed answer, and a
+  micro-optimization that won in isolation lost under real load. Lesson applied
+  afterwards: trust only end-to-end byte-level diffs of the actual output file,
+  never a partial view of the pipeline.
 
 ---
 
-## Testing strategy
+## 🧪 Testing strategy
 
 - **240 unit tests** (`make test`) covering the FSM, trie, validator, filter,
   oracle, and the full generator — including every documented bug as a
   regression case.
 - **Static analysis** in the same gate as the test suite: `flake8` + `mypy`
   (including `--warn-return-any`, `--disallow-untyped-defs`) must be clean.
-- **End-to-end suite**: the 11 public prompts run through the real `llm_sdk` and
-  are graded by the real `moulinette` (function-name and full-argument
-  accuracy), not by a hand-rolled proxy.
-- **Byte-level A/B**: behaviour-changing refactors are validated by diffing the
-  generated output before/after against a stored golden, so an "equivalent"
-  refactor is *proven* identical rather than assumed.
+- **End-to-end suite**: the 11 input prompts are decoded through the real
+  `llm_sdk` and checked on function-name and full-argument exact match.
+- **Byte-level A/B**: behaviour-changing refactors are validated by diffing
+  the full generated output before and after, so an "equivalent" refactor is
+  *proven* identical rather than assumed.
 - **Focused probes**: single-prompt scripts for isolating specific
   phases/behaviours during debugging.
 
 ---
 
-## Example usage
+## 🎬 Example usage
 
 ```bash
 # install
@@ -310,15 +405,15 @@ output (`data/output/answer.json`) is one call per prompt:
 
 ---
 
-## Resources
+## 📚 Resources
 
 ### References
 - Hugging Face, *Text Generation Inference* concepts — logits and constrained
   decoding. https://huggingface.co/docs
 - Gopher / grammar-constrained decoding — the general idea of restricting
   sampling to grammar-valid continuations.
-- The 42 subject brief: *Introduction to function calling in LLMs* (see
-  `docs/sources/en.subject.pdf` in the project repository).
+- The 42 subject brief: *Introduction to function calling in LLMs* (chapter VI,
+  "Readme Requirements", and chapter VII for the function-calling concepts).
 - `pydantic` documentation — schema-driven validation patterns.
   https://docs.pydantic.dev
 

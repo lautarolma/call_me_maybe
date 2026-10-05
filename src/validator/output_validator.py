@@ -18,6 +18,17 @@ Por qué NO un solo `json.loads` y ya:
   · Si no validamos acá, el error aparece en la moulinette del evaluador
     como un cero, no como un mensaje que podamos entender.
 
+LAS TRES REPARACIONES POST-HOC (`_repair_string_value`):
+  El modelo restringido copia bien la frase del usuario pero la deforma al
+  copiarla. Hay tres deformaciones medidas, y cada una tiene su reparación:
+    A · `_snap_to_query_span`     — copia TRUNCADA  (clip de puntuación líder)
+    B · `_restore_internal_quotes` — copia SIN comillas internas
+    C · `_collapse_repeated_run`   — copia CONTADA (una repetición por match)
+  Las tres son post-hoc (no tocan logits), derivadas de la query, y comparten una
+  sola norma: *el valor tiene que estar respaldado por la frase del usuario; si
+  no, es una invención y se normaliza*. Cuando no hay una corrección única
+  respaldada por evidencia, devuelven el valor SIN tocar.
+
 LA REGLA DE ORO — no romper el alineamiento posicional:
 La moulinette empareja answers y correcciones con `zip()`, que es
 POSICIONAL. Si una entry falta en medio, TODAS las de después se desalinean
@@ -128,6 +139,150 @@ def _snap_to_query_span(value: str, prompt: str) -> str:
     return prompt[left:start + len(value)]
 
 
+def _restore_internal_quotes(value: str, prompt: str) -> str:
+    """Restaura las comillas dobles INTERNAS que el modelo se comió al copiar.
+
+    QUÉ PROBLEMA RESUELVE (caso real medido, test privado 11):
+    el prompt dice ``Format template: Say "hello" to {name}`` y el modelo emite
+    ``template = "Say hello to {name}"``: copió perfecto el contenido pero se
+    comió las comillas que delimitan ``hello`` dentro del valor.
+
+    LA REGLA (cinco pasos):
+    1. Se borran TODAS las comillas dobles de la query, guardando el mapa de
+       índices para poder volver a las coordenadas originales.
+    2. Se buscan todas las ocurrencias del valor en esa query mutilada.
+    3. De cada una se recupera el slice ORIGINAL que le corresponde (incluye
+       las comillas que el paso 1 se había saltado).
+    4. Se descartan los slices que (a) son idénticos al valor —no hay nada que
+       restaurar— o (b) empiezan o terminan en comilla.
+    5. Si queda EXACTAMENTE UNO, se devuelve. Si queda cero o más de uno, se
+       devuelve el valor sin tocar.
+
+    POR QUÉ SE DESCARTAN LAS COMILLAS DE LOS BORDES (el contraejemplo que
+    define la regla): el prompt ``Replace all numbers in "Hello 34 I'm 233
+    years old" with NUMBERS`` tiene el valor entre comillas, pero esas comillas
+    son el MARCO de la frase, no su contenido: el valor esperado es el texto
+    SIN ellas. Sin este filtro, la regla le agregaría las comillas y rompería
+    ese test público —y también el de ``Reverse the string 'hello'``.
+
+    POR QUÉ EXIGE UN SOLO CANDIDATO: sin esa exigencia la regla empieza a
+    adivinar. En ``Say "hello" and hello`` hay dos ocurrencias y la correcta es
+    NO tocar nada; con ``Use "a" or "b" for {x}`` el valor ``a`` aparece
+    dentro de palabras ("Form**a**t"), así que la evidencia es ambigua. Ante
+    duda, se queda callada: el costo de callarse es un test igual de fallado,
+    y el costo de adivinar es romper los 38 valores que hoy funcionan.
+    """
+    if not value:
+        return value
+    stripped_chars: list[str] = []
+    positions: list[int] = []
+    for index, char in enumerate(prompt):
+        if char == '"':
+            continue
+        stripped_chars.append(char)
+        positions.append(index)
+    stripped = "".join(stripped_chars)
+
+    candidates: list[str] = []
+    start = 0
+    while True:
+        found = stripped.find(value, start)
+        if found < 0:
+            break
+        # `end` es exclusivo sobre `stripped`; `positions[end - 1]` es el
+        # último carácter del slice y por eso el +1 del corte en `prompt`.
+        end = found + len(value)
+        original = prompt[positions[found]:positions[end - 1] + 1]
+        start = found + 1
+        if original == value:
+            continue
+        if original[0] == '"' or original[-1] == '"':
+            continue
+        candidates.append(original)
+
+    if len(set(candidates)) != 1:
+        return value
+    return candidates[0]
+
+
+def _collapse_repeated_run(value: str, prompt: str) -> str:
+    """Deshace el conteo cuando el modelo repitió un carácter por cada match.
+
+    QUÉ PROBLEMA RESUELVE (caso real medido, test público 9):
+    el prompt dice ``Replace all vowels in 'Programming is fun' with
+    asterisks`` y el modelo emite ``replacement = "****"``. En cualquier API de
+    sustitución —``re.sub`` de Python, ``sed``, ``replace`` de JavaScript— el
+    ``replacement`` es una PLANTILLA que se aplica a todas las coincidencias,
+    no una copia por coincidencia. El modelo contó las vocales y escribió una
+    estrella por vocal: ejecutó la instrucción en vez de parametrizarla. El
+    valor correcto es el carácter repetido UNA vez.
+
+    LA REGLA (cuatro pasos):
+    1. El valor tiene que ser ENTERAMENTE una corrida de >= 2 caracteres
+       idénticos.
+    2. Esa corrida NO puede aparecer literal en la query: si el modelo la
+       copió, la repetición es intencional y no se toca.
+    3. Se busca la corrida más larga que la query SÍ muestra y se usa esa.
+    4. Si la query no muestra ninguna, se deja un solo carácter.
+
+    POR QUÉ EL PASO 3 EXISTE (el agujero medido de la versión simple): si la
+    query muestra ``***`` y el modelo cuenta cinco, colapsar siempre a uno
+    devolvería ``*`` en vez de ``***``. La versión "respeta el conteo de la
+    query" devuelve ``***``. En el caso real la query no muestra ninguna
+    corrida —dice "asterisks", la palabra inglesa, no el símbolo— y por eso
+    ahí sí se cae al paso 4.
+
+    POR QUÉ EXIGE QUE EL VALOR ENTERO SEA LA CORRIDA: una versión más amplia
+    que reconociera "un bloque repetido" (tipo ``ababab`` -> ``ab``) está
+    ROTA — sobre el caso real devolvería ``**`` en vez de ``*``, porque una
+    corrida de cuatro iguales también es "un bloque de dos repetido dos
+    veces". Medido: esa variante baja el set público de 11/11 a 10/11. Los
+    valores legítimos con repetición (``utf-8``, ``/home/user/data.json``,
+    ``NUMBERS``, ``dog``) tienen caracteres distintos y quedan intactos.
+
+    NOTA DE LEGITIMIDAD: la regla se apoya en una FIRMA ESTRUCTURAL (la
+    corrida de caracteres), no en un vocabulario. Anclar la corrección a la
+    palabra "asterisks" sería una tabla de búsqueda hardcodeada y está
+    prohibido por el subject; anclarla a la forma de la salida no.
+    """
+    if len(value) < 2:
+        return value
+    if len(set(value)) != 1:
+        return value
+    if value in prompt:
+        return value
+    for length in range(len(value), 1, -1):
+        head = value[:length]
+        if head in prompt:
+            return head
+    return value[:1]
+
+
+def _repair_string_value(value: str, prompt: str) -> str:
+    """Aplica las tres reparaciones post-hoc, en orden, y la primera gana.
+
+    POR QUÉ "LA PRIMERA QUE CORRIGE GANA" y no las tres en cadena: cada regla
+    exige la evidencia que la anterior no tenía. `_snap_to_query_span` sólo
+    dispara si el valor ES un substring de la query. Si no lo es, A no debía
+    tocar nada, así que la cadena sigue a `_restore_internal_quotes`, que
+    exige que aparezca al quitar las comillas. Y `_collapse_repeated_run`
+    sólo mira corridas de caracteres idénticos, forma que B nunca produce
+    (B devuelve slices con comillas, que no son corridas). Son disjuntas por
+    construcción, y esta forma lo hace explícito en el código.
+
+    El orden NO es arbitrario: A es la regla ya verificada y commiteada, así
+    que si B o C tuvieran un defecto, el comportamiento previo queda cubierto
+    por el regression suite.
+    """
+    snapped = _snap_to_query_span(value, prompt)
+    if snapped != value:
+        return snapped
+    quoted = _restore_internal_quotes(snapped, prompt)
+    if quoted != snapped:
+        return quoted
+    return _collapse_repeated_run(quoted, prompt)
+
+
 def build_function_call(prompt: str, payload: dict[str, object]) -> FunctionCall:
     """Construye un FunctionCall validado desde (prompt, payload parseado).
 
@@ -147,12 +302,14 @@ def build_function_call(prompt: str, payload: dict[str, object]) -> FunctionCall
     name = payload.get("name")
     parameters = payload.get("parameters", {})
     raw_parameters = parameters if isinstance(parameters, dict) else {}
-    # Re-ancla cada value string a su tramo VERBATIM en la query: el modelo
-    # copia bien el contenido pero suele clipear la puntuación líder (ver
-    # `_snap_to_query_span`). Los no-string (números, bools, null) pasan
-    # intactos — el proyecto limita los params a escalares (models/output.py).
-    snapped_parameters = {
-        key: _snap_to_query_span(value, prompt) if isinstance(value, str) else value
+    # Aplica las TRES reparaciones post-hoc a cada value string (ver
+    # `_repair_string_value`). Las tres corrigen la misma clase de defecto: el
+    # modelo es un copiador y deforma la frase mientras copia — la recorta
+    # (A), le come las comillas internas (B), o cuenta repeticiones en vez de
+    # parametrizar (C). Los no-string (números, bools, null) pasan intactos: el
+    # proyecto limita los params a escalares (models/output.py).
+    repaired_parameters = {
+        key: _repair_string_value(value, prompt) if isinstance(value, str) else value
         for key, value in raw_parameters.items()
     }
     return FunctionCall(
@@ -165,7 +322,7 @@ def build_function_call(prompt: str, payload: dict[str, object]) -> FunctionCall
         # `raw_parameters` es `object` para mypy (viene de `payload`); el
         # isinstance de arriba ya lo estrechó a dict. El default {} cubre el
         # caso "el decoder emitió solo el name" (fn sin parámetros).
-        parameters=snapped_parameters,
+        parameters=repaired_parameters,
     )
 
 

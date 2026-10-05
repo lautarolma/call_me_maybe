@@ -17,6 +17,10 @@ import json
 from src.models.output import FunctionCall
 from src.validator.output_validator import (
     _UNKNOWN_FN_SENTINEL,
+    _collapse_repeated_run,
+    _repair_string_value,
+    _restore_internal_quotes,
+    _snap_to_query_span,
     build_function_call,
     build_results,
     find_unsupported_prompts,
@@ -97,12 +101,15 @@ def test_snap_stops_at_alphanumeric_suffix() -> None:
 
 
 def test_snap_leaves_value_absent_from_prompt() -> None:
-    """Sin ocurrencia verbatim no hay re-anclaje posible (P9: '****')."""
-    call = build_function_call(
-        "Replace all vowels with asterisks",
-        {"name": "fn_substitute_string_with_regex", "parameters": {"replacement": "****"}},
-    )
-    assert call.parameters["replacement"] == "****"
+    """Sin ocurrencia verbatim la regla A no tiene a qué re-anclarse.
+
+    Se prueba la regla A DIRECTAMENTE y no por `build_function_call` a propósito:
+    el pipeline completo sí corrige este valor, pero por la regla C (§8.9). La
+    cobertura que importa acá es "A sola no hace nada", y `build_function_call`
+    ya no puede observarla.
+    """
+    prompt = "Replace all vowels with asterisks"
+    assert _snap_to_query_span("****", prompt) == "****"
 
 
 def test_snap_ignores_non_string_values() -> None:
@@ -118,6 +125,147 @@ def test_snap_is_noop_with_empty_prompt() -> None:
     """`validate_output` construye con prompt="" → no-op por diseño."""
     call = build_function_call("", {"name": "fn_x", "parameters": {"s": "home/user"}})
     assert call.parameters["s"] == "home/user"
+
+
+# --------------------------------------------------------------------------
+# _restore_internal_quotes — restitución de comillas dobles INTERNAS
+# --------------------------------------------------------------------------
+def test_quotes_restores_internal_quotes_dropped_by_model() -> None:
+    """Test privado 11: copia bien el contenido pero se come las comillas."""
+    prompt = 'Format template: Say "hello" to {name}'
+    assert _restore_internal_quotes("Say hello to {name}", prompt) == 'Say "hello" to {name}'
+
+
+def test_quotes_restores_internal_quotes_mirror_case() -> None:
+    """No es un caso único: 'hi' en vez de 'hello' se comporta igual."""
+    prompt = 'Format template: Say "hi" to {user}'
+    assert _restore_internal_quotes("Say hi to {user}", prompt) == 'Say "hi" to {user}'
+
+
+def test_quotes_ignores_delimiting_quotes_around_whole_value() -> None:
+    """El contraejemplo que define la regla: las comillas del MARCO son
+    delimitadores, no contenido. Este valor NO se toca (test público)."""
+    prompt = "Replace all numbers in \"Hello 34 I'm 233 years old\" with NUMBERS"
+    value = "Hello 34 I'm 233 years old"
+    assert _restore_internal_quotes(value, prompt) == value
+
+
+def test_quotes_skips_value_already_verbatim() -> None:
+    """Si el valor ya aparece literal, no hay nada que restaurar."""
+    assert _restore_internal_quotes("hello", 'Say "hello" and hello') == "hello"
+
+
+def test_quotes_stays_silent_when_ambiguous() -> None:
+    """Dos ocurrencias candidatas → la regla se calla en vez de adivinar."""
+    assert _restore_internal_quotes("abc", 'Echo "abc" and abc to stdout') == "abc"
+
+
+def test_quotes_stays_silent_when_only_delimited_spans_exist() -> None:
+    """Sin comillas internas en juego no hay corrección posible."""
+    assert _restore_internal_quotes("x", 'Format: "x" and "x"') == "x"
+
+
+def test_quotes_is_noop_without_double_quotes_in_prompt() -> None:
+    """Sin comillas dobles la query mutada es idéntica a la original."""
+    assert _restore_internal_quotes("Say hello", "Say hello") == "Say hello"
+
+
+def test_quotes_is_noop_with_empty_value() -> None:
+    """Un valor vacío no se busca ni se devuelve nada."""
+    assert _restore_internal_quotes("", 'Say "hello"') == ""
+
+
+# --------------------------------------------------------------------------
+# _collapse_repeated_run — deshacer el conteo de repeticiones
+# --------------------------------------------------------------------------
+def test_collapse_undoes_count_when_query_shows_no_run() -> None:
+    """Test público 9: el modelo contó las vocales; la query no muestra el
+    símbolo, dice la palabra 'asterisks'. Queda un solo carácter."""
+    prompt = "Replace all vowels in 'Programming is fun' with asterisks"
+    assert _collapse_repeated_run("****", prompt) == "*"
+
+
+def test_collapse_respects_the_count_the_query_shows() -> None:
+    """El agujero medido de la versión simple: si la query muestra '***' y el
+    modelo contó cinco, el resultado es '***' y NO '*'."""
+    assert _collapse_repeated_run("*****", "Replace vowels with ***") == "***"
+
+
+def test_collapse_works_for_any_repeated_symbol() -> None:
+    """La regla es agnóstica de vocabulario: sirve para cualquier símbolo."""
+    assert _collapse_repeated_run("=====", "Set padding to ===") == "==="
+
+
+def test_collapse_keeps_run_that_is_verbatim_in_prompt() -> None:
+    """Si el modelo copió la corrida, la repetición es INTENCIONAL."""
+    assert _collapse_repeated_run("**", "Replace vowels with **") == "**"
+
+
+def test_collapse_skips_single_character() -> None:
+    """Sin repetición no hay conteo que deshacer."""
+    assert _collapse_repeated_run("*", "Replace vowels with asterisks") == "*"
+
+
+def test_collapse_skips_values_that_are_not_a_pure_run() -> None:
+    """Más de un carácter distinto → no es una corrida de repeticiones."""
+    assert _collapse_repeated_run("NUMBERS", "Replace with NUMBERS") == "NUMBERS"
+    assert _collapse_repeated_run("dog", "Substitute cat with dog") == "dog"
+
+
+def test_collapse_skips_block_repetition() -> None:
+    """La variante que matamos por medición: reconocer 'ababab' como bloque
+    repetido daría '**' sobre el caso real (4 iguales = 2 bloques de 2)."""
+    assert _collapse_repeated_run("abababab", "Repeat the unit ab") == "abababab"
+
+
+def test_collapse_keeps_real_paths_and_encodings_intact() -> None:
+    """Los valores legítimos con repetición tienen chars distintos: no tocan."""
+    assert _collapse_repeated_run("/home/user/data.json", "Read the file at /home/user/data.json") == \
+        "/home/user/data.json"
+    assert _collapse_repeated_run("utf-8", "with utf-8 encoding") == "utf-8"
+    assert _collapse_repeated_run("latin-1", "with latin-1 encoding") == "latin-1"
+
+
+# --------------------------------------------------------------------------
+# _repair_string_value — la cadena A -> B -> C
+# --------------------------------------------------------------------------
+def test_chain_applies_the_repair_that_has_evidence() -> None:
+    """Cada regla sólo dispara si la anterior no tenía evidencia."""
+    # A: el valor es verbatim y con puntuación líder → la estira.
+    assert _repair_string_value("home/user/data.json", "Read the file at /home/user/data.json") == \
+        "/home/user/data.json"
+    # B: no es verbatim pero aparece al quitar comillas.
+    assert _repair_string_value("Say hello to {name}", 'Format template: Say "hello" to {name}') == \
+        'Say "hello" to {name}'
+    # C: corrida de repetidos sin respaldo en la query.
+    assert _repair_string_value("****", "Replace all vowels with asterisks") == "*"
+    # Ninguna tiene evidencia → intacto.
+    assert _repair_string_value("dog", "Substitute cat with dog") == "dog"
+
+
+def test_chain_fixes_template_case_end_to_end() -> None:
+    """Test privado 11 medido a través de la función real del pipeline."""
+    prompt = 'Format template: Say "hello" to {name}'
+    payload = {"name": "fn_format_template", "parameters": {"template": "Say hello to {name}"}}
+    call = build_function_call(prompt, payload)
+    assert call.parameters["template"] == 'Say "hello" to {name}'
+
+
+def test_chain_fixes_replacement_case_end_to_end() -> None:
+    """Test público 9 medido a través de la función real del pipeline."""
+    prompt = "Replace all vowels in 'Programming is fun' with asterisks"
+    payload = {"name": "fn_substitute_string_with_regex", "parameters": {"replacement": "****"}}
+    call = build_function_call(prompt, payload)
+    assert call.parameters["replacement"] == "*"
+
+
+def test_chain_leaves_non_string_values_untouched() -> None:
+    """Números/bools/null no entran a la cadena de reparaciones."""
+    call = build_function_call(
+        "What is the product of 3 and 5?",
+        {"name": "fn_multiply_numbers", "parameters": {"a": 3, "b": 5.0}},
+    )
+    assert call.parameters == {"a": 3, "b": 5.0}
 
 
 # --------------------------------------------------------------------------

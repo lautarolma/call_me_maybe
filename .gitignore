@@ -42,9 +42,16 @@ data/correction/
 *.tmp
 *.bak
 
-# AI assistant context (local only — no es parte de la submission del subject VIII)
+# AI assistant context y documentación interna (local only — no es parte de la
+# submission del subject VIII).
+# - CLAUDE.md: contexto de agente, ya eliminado del track.
+# - docs/: material de preparación privado (tracking, diseño, notas). Antes era
+#   submodule apuntando a un repo privado; hoy es directorio local standalone.
+#   El repo principal queda como ENTREGA PURA: src/, tests/, data/input/,
+#   README.md, uv.lock, configs de lint.
 CLAUDE.md
 .opencode/
+docs/
 
 # La moulinette es el CÓDIGO DEL EVALUADOR (la herramienta que nos califica),
 # no trabajo nuestro. El peer review la ejecuta desde su propia copia: si la

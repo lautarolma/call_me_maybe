@@ -51,6 +51,7 @@ data/correction/
 #   README.md, uv.lock, configs de lint.
 CLAUDE.md
 .opencode/
+.claude/
 docs/
 
 # La moulinette es el CÓDIGO DEL EVALUADOR (la herramienta que nos califica),

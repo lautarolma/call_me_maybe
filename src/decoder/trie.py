@@ -1,15 +1,15 @@
-"""Trie (prefix tree) para nombres de funciones del constrained decoder.
+"""Trie (prefix tree) for function names in the constrained decoder.
 
-Tarea 3.2 — Construido dinámicamente desde los nombres de las funciones en
-functions_definition.json.  Cada nodo es un carácter del nombre; los nodos
-terminales llevan el nombre completo y `is_end = True`.  Zero hardcoding:
-si mañana se agregan funciones al JSON, el trie se adapta automáticamente.
+Built dynamically from the names in ``functions_definition.json``: every
+node is one character, terminal nodes carry the full name and
+``is_end = True``. Zero hardcoding — new functions in the JSON extend
+the trie automatically.
 
-API pública (lo que usan el token_filter y el facade):
-  - build_trie(names)        → raíz del trie
-  - find_node(prefix)        → nodo del prefijo o None
-  - valid_next_chars(prefix) → chars que extienden al menos un nombre
-  - is_complete_name(prefix) → True si el prefijo ES exactamente un nombre
+Public API (used by the token filter and the decoder facade):
+  - build_trie(names)         -> trie root
+  - find_node(prefix)         -> node for the prefix, or None
+  - valid_next_chars(prefix)  -> chars that keep at least one name viable
+  - is_complete_name(prefix)  -> True if the prefix IS exactly a name
 """
 
 from __future__ import annotations
@@ -19,11 +19,11 @@ from dataclasses import dataclass, field
 
 @dataclass(slots=True)
 class TrieNode:
-    """Nodo de un trie de caracteres.
+    """One node of a character trie.
 
-    slots=True por la misma razón que state.py (Decisión 8 del plan): el
-    filter (Task 3.4) recorre este trie por cada token candidato; slots
-    elimina __dict__ (menos memoria, acceso más rápido).
+    ``slots=True`` for the same reason as ``state.py``: the filter walks
+    this trie for every candidate token, and ``__slots__`` drops
+    ``__dict__`` (less memory, faster attribute access).
     """
 
     children: dict[str, TrieNode] = field(default_factory=dict)
@@ -32,11 +32,10 @@ class TrieNode:
 
 
 def build_trie(function_names: list[str]) -> TrieNode:
-    """Construye un trie desde una lista de nombres de función.
+    """Build a trie from a list of function names.
 
-    Cada carácter del nombre genera un nivel de nodo.  Al terminar cada
-    nombre se marca el nodo como terminal con `is_end = True` y se almacena
-    el nombre completo en `function_name`.
+    Each character adds one node level; when a name ends its node is
+    marked terminal (``is_end = True``) and stores the full name.
     """
     root = TrieNode()
     for name in function_names:
@@ -51,10 +50,10 @@ def build_trie(function_names: list[str]) -> TrieNode:
 
 
 def find_node(root: TrieNode, prefix: str) -> TrieNode | None:
-    """Recorre el trie con *prefix* y devuelve el nodo resultante.
+    """Walk the trie by *prefix* and return the resulting node.
 
-    Retorna ``None`` si algún carácter del prefijo no existe en el trie
-    (path inexistente).
+    Returns ``None`` when some character of the prefix is missing (the
+    path does not exist).
     """
     node = root
     for char in prefix:
@@ -65,11 +64,10 @@ def find_node(root: TrieNode, prefix: str) -> TrieNode | None:
 
 
 def valid_next_chars(root: TrieNode, prefix: str) -> set[str]:
-    """Devuelve los caracteres que, añadidos a *prefix*, mantienen al menos
-    un nombre como candidato válido.
+    """Characters that, appended to *prefix*, keep at least one name viable.
 
-    Si *prefix* no existe en el trie (path inexistente), retorna un set
-    vacío — significa que el modelo está generando un nombre inválido.
+    An unknown path returns an empty set — the model is generating an
+    invalid name.
     """
     node = find_node(root, prefix)
     if node is None:
@@ -78,6 +76,6 @@ def valid_next_chars(root: TrieNode, prefix: str) -> set[str]:
 
 
 def is_complete_name(root: TrieNode, prefix: str) -> bool:
-    """True si *prefix* coincide exactamente con un nombre de función."""
+    """True when *prefix* matches a function name exactly."""
     node = find_node(root, prefix)
     return node is not None and node.is_end

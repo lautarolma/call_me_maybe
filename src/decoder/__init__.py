@@ -1,10 +1,7 @@
-"""Decoder constrained: state machine + trie (futuro schema/token_filter).
+"""Constrained decoder: state machine, trie, schema and token filter.
 
-ROL DE ESTE __init__.py (por dentro):
-- Facade de imports (mismo patrón que src/loader/__init__.py): los
-  consumidores hablan con el package, no con los submódulos internos.
-- state.py + trie.py ya existen; schema_validator.py llegó con la Task 3.3
-  y token_filter.py cerrará con la 3.4: amplían este __all__.
+Re-exports the decoder's public API as a facade (same pattern as
+``src.loader``); the individual modules stay the implementation.
 """
 
 from src.decoder.schema_validator import SchemaContext

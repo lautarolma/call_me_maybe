@@ -1,27 +1,25 @@
-"""Máquina de estados del constrained JSON decoder (Task 3.1).
+"""State machine of the constrained JSON decoder.
 
-POR QUÉ EXISTE ESTE MÓDULO (por dentro):
-- El modelo NO genera JSON libre: en cada step hay que validar que el token
-  propuesto mantenga el output como JSON sintácticamente válido. Esta state
-  machine es el "árbitro sintáctico": dado el estado actual, decide si cada
-  carácter (y por ende el token completo) es legal.
-- Es la capa MÁS caliente del pipeline: compute_allowed_ids (Task 3.4) llama
-  a simulate() por cada token candidato (~151K ids en el peor caso). Por eso
-  es un @dataclass(slots=True) y NO Pydantic: Pydantic cuesta ~200μs por
-  instanciación; un dataclass con slots no tiene __dict__ y se copia en ~50ns.
-- NO conoce el schema (qué keys existen, qué tipos se esperan): eso es
-  trabajo de schema_validator.py (Task 3.3). Acá solo se garantiza SINTAXIS
-  JSON sobre el subconjunto del subject: objeto con keys, values string /
-  number / bool / null, y UN nivel de anidamiento (parameters).
-  Única concesión: name_buffer acumula el TEXT del value de "name"
-  (desvío Task 3.3) — bookkeeping que el schema lee, no validación.
+The model does not generate free JSON: on every step this machine
+decides, from the current state, whether a character — and therefore a
+complete token — is legal. It is the pipeline's syntactic arbiter and
+its hottest layer: ``compute_allowed_ids`` calls ``simulate()`` once
+per candidate token (up to ~151K ids), hence ``@dataclass(slots=True)``
+and never pydantic — model instantiation would dominate the loop.
 
-CONTRATO DE USO (dos caminos):
-- simulate(token_text) -> (bool, DecoderState): EXPLORA sin tocar el estado
-  real. El token filter la llama para cada candidato.
-- update_from_text(token_text) -> bool: AVANZA el estado real (muta) con el
-  token GANADOR. Es atómico: si algún carácter falla, el estado queda tal
-  cual estaba (se simula sobre una copia y se commitea solo si todo pasó).
+It knows nothing about the schema (which keys exist, which types are
+expected: that is ``schema_validator``'s job). Only JSON syntax over
+the subject's subset: an object with keys, string/number/bool/null
+values and one level of nesting (``parameters``). The one concession:
+``name_buffer`` accumulates the text of the output's "name" value —
+bookkeeping the schema reads, not syntax validation.
+
+Two use paths:
+- ``simulate(token_text) -> (bool, DecoderState)`` explores without
+  touching the real state; the token filter calls it per candidate.
+- ``update_from_text(token_text) -> bool`` advances the real state with
+  the winning token, atomically: any failing character leaves the
+  state exactly as it was.
 """
 
 from __future__ import annotations
@@ -31,101 +29,98 @@ from copy import copy
 from dataclasses import dataclass, field
 from enum import Enum
 
-# Whitespace JSON: space, tab, newline, carriage return. Nada más.
+# JSON whitespace: space, tab, newline, carriage return. Nothing else.
 _WS = " \t\n\r"
 _DIGITS = "0123456789"
 _HEX_DIGITS = "0123456789abcdefABCDEF"
-# Escapess simples de JSON: \" \\ \/ \n \t \r \b \f (el \uXXXX va aparte
-# porque consume 4 dígitos hex y puede partirse entre tokens).
+# Simple JSON escapes: \" \\ \/ \n \t \r \b \f (\uXXXX is separate: it
+# consumes 4 hex digits and can be split across tokens).
 _SIMPLE_ESCAPES = frozenset('"\\/nrtbf')
 
-# Grammar de number JSON:  -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
-#   _NUMBER_PREFIX_RE: versión "a medio terminar" (acepta "2." y "2e+")
-#   para la validación incremental char por char. El signo inicial "-" se
-#   incorpora en _step_colon() y debe ser seguido por un dígito. Los *
-#   permiten cero o más caracteres en las partes que pueden quedar pendientes.
-#   Rechaza leading zeros ("01") porque la primera alternativa
-#   solo tolera "0" SOLO, y la segunda no puede arrancar con cero.
-#   OJO la alternancia de la parte decimal: "2.e" DEBE fallar (un punto sin
-#   dígitos deja la fracción pendiente: el exponente solo es legal DESPUÉS
-#   de al menos un dígito). Por eso: fracción con dígitos + exponente
-#   opcional | punto con dígitos pendientes (sin exponente) | exponente.
+# JSON number grammar:  -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+#   _NUMBER_PREFIX_RE: the "half-finished" version (accepts "2." and "2e+")
+#   for incremental char-by-char validation. The leading "-" joins in
+#   _step_colon() and must be followed by a digit. The * allows zero or
+#   more characters in the parts that may still be pending. Leading zeros
+#   ("01") are rejected: the first alternative tolerates only "0" alone,
+#   and the second cannot start with zero. Watch the decimal alternation:
+#   "2.e" MUST fail (a dot with no digits leaves the fraction pending; the
+#   exponent is only legal AFTER at least one digit) — hence: fraction
+#   with digits + optional exponent | dot with pending digits (no
+#   exponent) | exponent.
 _NUMBER_PREFIX_RE = re.compile(
     r"-?(0|[1-9][0-9]*)(\.[0-9]+([eE][+-]?[0-9]*)?|\.[0-9]*|[eE][+-]?[0-9]*)?"
 )
-#   _NUMBER_RE: versión estricta para decidir si el buffer TIENE un número
-#   completo al momento de cerrar el value ("," / "}" / whitespace).
+#   _NUMBER_RE: strict version deciding whether the buffer HOLDS a
+#   complete number when the value closes ("," / "}" / whitespace).
 _NUMBER_RE = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?")
 
 
 class DecoderPhase(str, Enum):
-    """Fases de la state machine del output JSON.
+    """Phases of the output-JSON state machine.
 
-    Elegido como `str, Enum`: cada miembro ES su nombre ("ROOT" ==
-    DecoderPhase.ROOT), lo que da repr legibles en logs y comparaciones
-    directas contra strings sin castear.
+    ``str, Enum`` so each member IS its name (``DecoderPhase.ROOT ==
+    "ROOT"``): readable reprs in logs and direct comparison against
+    strings without casting.
     """
 
-    ROOT = "ROOT"                    # Estado inicial: esperando '{'
-    OBJECT_OPEN = "OBJECT_OPEN"      # '{' leído: esperando el primer '"'
-    IN_OBJECT = "IN_OBJECT"          # En el output object: key o '}'
-    KEY_START = "KEY_START"          # '"' de apertura de key leído
-    IN_KEY = "IN_KEY"                # Acumulando caracteres de la key
-    KEY_END = "KEY_END"              # '"' de cierre de key: esperando ':'
-    COLON = "COLON"                  # ':' leído: esperando el value
-    VALUE_START = "VALUE_START"      # (reservado por el plan A6.3; no se usa)
+    ROOT = "ROOT"                    # initial state: waiting for '{'
+    OBJECT_OPEN = "OBJECT_OPEN"      # '{' read: waiting for the first '"'
+    IN_OBJECT = "IN_OBJECT"          # inside the output object: key or '}'
+    KEY_START = "KEY_START"          # opening '"' of a key read
+    IN_KEY = "IN_KEY"                # accumulating key characters
+    KEY_END = "KEY_END"              # closing '"' read: waiting for ':'
+    COLON = "COLON"                  # ':' read: waiting for the value
+    VALUE_START = "VALUE_START"      # reserved; unreachable (no transition sets it)
     IN_STRING_VALUE = "IN_STRING_VALUE"
     IN_NUMBER_VALUE = "IN_NUMBER_VALUE"
     IN_BOOL_VALUE = "IN_BOOL_VALUE"  # true / false
     IN_NULL_VALUE = "IN_NULL_VALUE"  # null
     ESCAPE_IN_STRING = "ESCAPE_IN_STRING"
-    VALUE_END = "VALUE_END"          # Value cerrado: ',' o '}'
-    PARAMS_OBJECT = "PARAMS_OBJECT"  # Dentro del objeto parameters (depth 1)
-    COMPLETE = "COMPLETE"            # '}' final: generación detenida
+    VALUE_END = "VALUE_END"          # value closed: ',' or '}'
+    PARAMS_OBJECT = "PARAMS_OBJECT"  # inside the parameters object (depth 1)
+    COMPLETE = "COMPLETE"            # final '}': generation stops
 
 
 @dataclass(slots=True)
 class DecoderState:
-    """Estado mutable del decoder. UNO por generación (no por token).
+    """Mutable decoder state. ONE per generation (not per token).
 
-    POR QUÉ slots=True y no Pydantic (Decisión 8 del plan): el inner loop
-    instancia/copia este objeto por cada token candidato; __slots__ elimina
-    __dict__ (menos memoria, acceso más rápido) y copy.copy() ronda los ~50ns
-    contra los ~5μs de un deepcopy — viable porque keys_enclosed NUNCA se
-    muta in-place: siempre se reemplaza por un set nuevo (ver
-    _register_params_key).
+    ``slots=True`` and never pydantic: the inner loop copies this object
+    for every candidate token, so the layout must be trivial to copy —
+    ``__slots__`` drops ``__dict__``, and ``keys_enclosed`` is never
+    mutated in place (always replaced by a fresh set, see
+    ``_register_params_key``), which keeps ``copy.copy()`` safe.
     """
 
     phase: DecoderPhase = DecoderPhase.ROOT
-    current_key: str = ""              # Key cuyo value se está leyendo
-    keys_enclosed: set[str] = field(default_factory=set)  # Solo keys de parameters
+    current_key: str = ""              # key whose value is being read
+    keys_enclosed: set[str] = field(default_factory=set)  # parameters keys only
     depth: int = 0                     # 0 = output object, 1 = parameters
-    number_buffer: str = ""            # Acumula el number en curso
-    # ⚠ DESVÍO DOCUMENTADO (Task 3.3): la máquina acumula el TEXT del value
-    # de la key "name" (depth 0) para que SchemaContext resuelva la función
-    # seleccionada. Mismo espíritu que keys_enclosed: bookkeeping que el
-    # schema LEE, no validación sintáctica. Los escapes se SKIPPEAN: el
-    # buffer queda con el nombre "decodificado" (\u0066n_... → fn_...).
-    # ¿Por qué acá y no en el schema? Un token BPE puede mezclar estructura
-    # y contenido ('fn_add_numbers", "parameters": {'); reconstruir el span
-    # del name desde el estado post-token obligaría a re-simular el token.
-    # El único lugar que ve los chars en contexto es la state machine.
-    name_buffer: str = ""              # Text del value de "name" (depth 0)
-    bool_buffer: str = ""              # Acumula true/false/null en curso
-    unicode_remaining: int = 0         # Hex pendientes de un \uXXXX en curso
+    number_buffer: str = ""            # number being accumulated
+    # ⚠ DOCUMENTED DEVIATION: the machine accumulates the TEXT of the
+    # output object's "name" value (depth 0) so SchemaContext can resolve
+    # the selected function. Same spirit as keys_enclosed: bookkeeping the
+    # schema READS, not syntax validation. Escapes are skipped: the buffer
+    # holds the "decoded" name (\u0066n_... -> fn_...). Why here and not
+    # in the schema: one BPE token can mix structure and content
+    # ('fn_add_numbers", "parameters": {'); rebuilding the name's span
+    # from the post-token state would force re-simulating the token. The
+    # only place that sees the characters in context is this machine.
+    name_buffer: str = ""              # text of the output's "name" value (depth 0)
+    bool_buffer: str = ""              # true/false/null being accumulated
+    unicode_remaining: int = 0         # hex digits left in an in-flight \uXXXX
 
     # ------------------------------------------------------------------ API
 
     def simulate(self, token_text: str) -> tuple[bool, DecoderState]:
-        """Simula procesar UN token completo SIN mutar este estado.
+        """Simulate one complete token WITHOUT mutating this state.
 
-        CÓMO FUNCIONA (por dentro):
-        - Se trabaja sobre copy(self): shallow copy barata (slots, sets
-          reemplazados nunca mutados) y segura.
-        - Si CUALQUIER carácter falla, la generación del token es inválida:
-          se retorna (False, self) — el MISMO objeto original (spec A6.4).
-        - Devuelve el estado resultante para que el generator (Task 4.1)
-          pueda usarlo directamente sin re-simular el token ganador.
+        Runs on a shallow copy (cheap with slots; sets are replaced,
+        never mutated). If any character fails, the token is invalid:
+        it returns ``(False, self)`` — the same original object. On
+        success it returns the resulting state so the generator can
+        adopt it directly instead of re-simulating the winning token.
         """
         new_state = copy(self)
         for char in token_text:
@@ -134,15 +129,14 @@ class DecoderState:
         return True, new_state
 
     def update_from_text(self, text: str) -> bool:
-        """Avanza ESTE estado con un texto completo (token ganador). Atómico.
+        """Advance THIS state with a complete text (the winning token). Atomic.
 
-        CÓMO FUNCIONA (por dentro):
-        - Igual que simulate (copiar + avanzar char por char), pero al final
-          COMMITEA los campos de la copia en self. Si algo falla a mitad de
-          camino, self queda exactamente como antes — el generator nunca se
-          queda con un estado a medio token.
-        - Los campos se copian explícitamente (no __dict__.update) porque
-          slots=True no tiene __dict__; además es mypy-friendly.
+        Same copy-and-advance as ``simulate``, but at the end the copy's
+        fields are committed to ``self``: either the whole text is
+        consumed and the state moves on, or ``self`` stays exactly as it
+        was — the generator never keeps a half-applied token. Fields are
+        copied explicitly (not ``__dict__.update``) because ``slots=True``
+        has no ``__dict__``; mypy prefers it too.
         """
         new_state = copy(self)
         for char in text:
@@ -159,68 +153,65 @@ class DecoderState:
         return True
 
     def expected_first_chars(self) -> set[str]:
-        """Chars con los que PUEDE arrancar el próximo token (Fase 1 del filter).
+        """Characters the NEXT token may start with (Phase 1 of the filter).
 
-        CÓMO SE CONSUME (por dentro):
-        - Es la llave de entrada al pre-índice Vocab.tokens_starting_with
-          (primer carácter DECODIFICADO -> ids). Fase 1 de compute_allowed_ids
-          junta los buckets de todos estos chars.
-        - '*' es un comodín: significa "cualquier carácter real es posible"
-          (keys y strings libres). El filter lo interpreta como "saltarse el
-          pre-filtro" (Task 3.4). Los tokens <byte> nunca matchean estos
-          chars, quedan fuera de la generación.
-        - Para numbers devuelve EXACTAMENTE los chars que mantienen la
-          grammar: "2." solo admite dígitos, "2e" admite dígitos/+-/terminal.
+        Keys into ``Vocab.tokens_starting_with`` (decoded first character
+        -> ids): Phase 1 of ``compute_allowed_ids`` unions the buckets of
+        all these characters. ``'*'`` is a wildcard — "any real character
+        is possible" (free keys and strings) — which the filter reads as
+        "skip the pre-filter"; ``<byte>`` tokens never match, so they
+        stay out of generation. For numbers it returns EXACTLY the
+        characters the grammar allows: after ``"2."`` only digits; after
+        ``"2e"`` digits, ``+/-``, or a terminal.
         """
         phase = self.phase
         if phase is DecoderPhase.ROOT:
-            # El output SIEMPRE arranca con '{' (más ws posible adelante).
+            # the output ALWAYS starts with '{' (ws may follow).
             return {"{", *(_WS)}
         if phase is DecoderPhase.OBJECT_OPEN:
             return {'"', *(_WS)}
         if phase is DecoderPhase.IN_OBJECT:
             return {'"', "}", *(_WS)}
         if phase is DecoderPhase.KEY_START or phase is DecoderPhase.IN_KEY:
-            return {"*"}  # cualquier carácter puede iniciar/continuar una key
+            return {"*"}  # any character can start/continue a key
         if phase is DecoderPhase.KEY_END:
             return {":", *(_WS)}
         if phase is DecoderPhase.COLON:
             return {'"', "-", "{", "t", "f", "n", *(_DIGITS), *(_WS)}
         if phase is DecoderPhase.IN_STRING_VALUE:
             if self.unicode_remaining > 0:
-                return set(_HEX_DIGITS)  # siguiente(s) char(s) de \uXXXX
+                return set(_HEX_DIGITS)  # next char(s) of \uXXXX
             return {"*"}
         if phase is DecoderPhase.IN_NUMBER_VALUE:
-            # Terminales solo si el buffer ya es un number COMPLETO: con
-            # "2." (fracción pendiente) un ',' NO puede cerrar el value.
+            # terminals only once the buffer is a COMPLETE number: with
+            # "2." (fraction pending) a ',' cannot close the value.
             if self._is_valid_json_number():
                 return self._number_next_chars() | {",", "}", *(_WS)}
             return self._number_next_chars()
         if phase is DecoderPhase.IN_BOOL_VALUE or phase is DecoderPhase.IN_NULL_VALUE:
             target = self._literal_target()
             if self.bool_buffer == target:
-                return {",", "}", *(_WS)}  # literal completo: terminales
-            return {target[len(self.bool_buffer)]}  # el próximo char exacto
+                return {",", "}", *(_WS)}  # literal complete: terminals
+            return {target[len(self.bool_buffer)]}  # the exact next char
         if phase is DecoderPhase.ESCAPE_IN_STRING:
             return {*_SIMPLE_ESCAPES, "u"}
         if phase is DecoderPhase.VALUE_END:
             return {",", "}", *(_WS)}
         if phase is DecoderPhase.PARAMS_OBJECT:
             return {'"', "}", *(_WS)}
-        # COMPLETE (o estado inalcanzable): nada es válido.
+        # COMPLETE (or unreachable state): nothing is valid.
         return set()
 
     # ------------------------------------------------------- char transition
 
     def _advance_char(self, char: str) -> bool:
-        """Procesa UN carácter y mueve la state machine. False = inválido.
+        """Process ONE character and move the state machine. False = invalid.
 
-        CÓMO FUNCIONA (por dentro):
-        - Usa `match/case` nativo de Python 3.10: compilado en bytecode CPython
-          como jump table O(1), sin el overhead de instanciación de objetos ni
-          dict lookups.
-        - Agrupa las fases por rol de dominio (estructura de objeto, lectura de
-          keys, strings, números, literales) delegando en handlers concisos.
+        The native ``match/case`` dispatch (Python 3.10) compiles to a
+        CPython jump table — no per-branch object instantiation or dict
+        lookup — and groups the phases by domain role (object structure,
+        keys, strings, numbers, literals), delegating to concise
+        per-role handlers.
         """
         match self.phase:
             case DecoderPhase.ROOT:
@@ -263,7 +254,7 @@ class DecoderState:
             return True
         if char == "}":
             if self.phase is DecoderPhase.OBJECT_OPEN:
-                return False  # Objeto raíz vacío: el schema exige name/parameters
+                return False  # empty root object: the schema demands name/parameters
             if self.phase is DecoderPhase.IN_OBJECT:
                 self.phase = DecoderPhase.COMPLETE
                 return True
@@ -301,9 +292,9 @@ class DecoderState:
         if char in _WS:
             return True
         if char == '"':
-            # ⚠ DESVÍO DOCUMENTADO (Task 3.3): arranca un value de "name"
-            # NUEVO → reset del buffer acumulado. OJO el depth: el parámetro
-            # "name" de fn_greet vive en depth 1 y NO resetea el del output.
+            # ⚠ DOCUMENTED DEVIATION: a NEW "name" value starts -> reset the
+            # accumulated buffer. Watch the depth: fn_greet's "name" PARAM
+            # lives at depth 1 and must NOT reset the output's buffer.
             if self.current_key == "name" and self.depth == 0:
                 self.name_buffer = ""
             self.phase = DecoderPhase.IN_STRING_VALUE
@@ -348,26 +339,26 @@ class DecoderState:
             self.phase = DecoderPhase.VALUE_END
             return True
         if char == "\\":
-            # ⚠ BUG-011 (2026-09-24): un escape dentro del value de "name"
-            # (depth 0) nunca toca name_buffer (se skippea, ver abajo) —
-            # el trie de schema_validator.py ve el buffer intacto y lo deja
-            # pasar indefinidamente. Rechazarlo ACÁ, al leer el '\' mismo,
-            # es lo único que cubre TODOS los casos sin importar cómo el
-            # BPE fusione el escape en un token (un token completo '\n' de
-            # 2 chars resuelve la fase ESCAPE_IN_STRING->IN_STRING_VALUE
-            # DENTRO de simulate(): el estado final que ve schema_validator
-            # nunca queda en ESCAPE_IN_STRING, así que un guard ahí NO lo
-            # atrapa). Ningún nombre real usa '\\'; los params SÍ pueden
-            # (regex '\\d+' de fn_substitute_string_with_regex) — por eso
-            # el guard es específico a current_key=="name" and depth==0.
+            # ⚠ An escape inside the output's "name" value (depth 0) never
+            # touches name_buffer (it is skipped, see below) — the trie in
+            # schema_validator sees an intact buffer and would let it pass
+            # forever. Rejecting HERE, at the backslash itself, is the only
+            # place that covers EVERY case no matter how BPE fuses the
+            # escape into a token (a complete 2-char '\n' token resolves
+            # ESCAPE_IN_STRING -> IN_STRING_VALUE INSIDE simulate(), so the
+            # final state schema_validator sees never sits in
+            # ESCAPE_IN_STRING and a guard there would miss it). No real
+            # function name uses '\\'; parameter VALUES can (the '\\d+'
+            # regex of fn_substitute_string_with_regex) — hence this guard
+            # is specific to current_key == "name" and depth == 0.
             if self.current_key == "name" and self.depth == 0:
                 return False
             self.phase = DecoderPhase.ESCAPE_IN_STRING
             return True
-        # ⚠ DESVÍO DOCUMENTADO (Task 3.3): acumula el text del value de
-        # "name" SOLO en el name del output object (depth 0). Los chars en
-        # ESCAPE_IN_STRING y los hex de \uXXXX ya pasaron por arriba
-        # (skippeados): el buffer queda con el nombre "decodificado".
+        # ⚠ DOCUMENTED DEVIATION: accumulate the text of the "name" value
+        # ONLY for the output object's name (depth 0). Escape-phase chars
+        # and \uXXXX hex digits were already skipped above: the buffer ends
+        # up with the "decoded" name.
         if self.current_key == "name" and self.depth == 0:
             self.name_buffer += char
         return True
@@ -415,32 +406,32 @@ class DecoderState:
     # ------------------------------------------------------------- helpers
 
     def _start_new_key(self) -> None:
-        """Reinicia el acumulador de key al abrir una nueva (viene el '"')."""
+        """Reset the key accumulator when a new key opens (the '"' arrives)."""
         self.current_key = ""
 
     def _register_params_key(self) -> None:
-        """Suma current_key a keys_enclosed si la key vive en parameters.
+        """Add current_key to keys_enclosed if the key lives in parameters.
 
-        POR QUÉ depth == 1: keys_enclosed alimenta a schema_validator
-        (Task 3.3) para saber qué required keys de parameters ya fueron
-        emitidas. Las keys del output object ("name", "parameters") NO van.
-        NOTA de memoria: el set SIEMPRE se reemplaza (set | {...}), nunca se
-        muta in-place, para que copy.copy() de simulate sea seguro: un shallow
-        copy comparte la referencia del set; si la mutáramos, la copia
-        contaminaría al original (y viceversa).
+        Why ``depth == 1``: keys_enclosed feeds ``schema_validator`` so it
+        knows which required parameters keys were already emitted. The
+        output object's keys ("name", "parameters") never go in. Memory
+        note: the set is ALWAYS replaced (``set | {...}``), never mutated
+        in place, so ``simulate()``'s ``copy.copy()`` stays safe: a
+        shallow copy shares the set reference, and in-place mutation
+        would contaminate original and copy alike.
         """
         if self.depth == 1 and self.current_key:
             self.keys_enclosed = set(self.keys_enclosed) | {self.current_key}
 
     def _close_value(self, terminal: str) -> bool:
-        """Cierra el value actual con un terminal (ws / ',' / '}').
+        """Close the current value with a terminal (ws / ',' / '}').
 
-        Pre: la VALIDACIÓN del tipo (number grammar o literal completo) ya
-        corrió en la rama de la phase; acá solo la estructura: registrar la
-        key cerrada y mover a la fase de espera.
-        El whitespace NO consume: deja la phase en VALUE_END (el siguiente
-        ',' o '}' real es quien transiciona). Los buffers se limpian para
-        no dejar basura de un value en el siguiente.
+        Pre: TYPE validation (number grammar or complete literal) already
+        ran in the phase branch; only structure happens here — register
+        the closed key and move to the waiting phase. Whitespace does not
+        consume: the phase stays VALUE_END for the next real ',' or '}'.
+        Buffers are cleared so one value's leftovers never leak into the
+        next.
         """
         self._register_params_key()
         self.number_buffer = ""
@@ -464,23 +455,25 @@ class DecoderState:
         return True
 
     def _literal_target(self) -> str:
-        """Literal contra el que se valida el buffer bool/null en curso."""
+        """Literal the in-flight bool/null buffer is validated against."""
         if self.phase is DecoderPhase.IN_NULL_VALUE:
             return "null"
         return "true" if self.bool_buffer[:1] == "t" else "false"
 
     def _is_valid_json_number(self) -> bool:
-        """True si el buffer es un number JSON COMPLETO (regex estricta)."""
+        """True if the buffer is a COMPLETE JSON number (strict regex)."""
         return _NUMBER_RE.fullmatch(self.number_buffer) is not None
 
     def _number_next_chars(self) -> set[str]:
-        """Chars que mantienen el number actual como PREFIXO válido.
+        """Characters that keep the current number a valid PREFIX.
 
-        CÓMO FUNCIONA (por dentro): prueba cada char de la grammar contra el
-        regex de prefijo. Con number_buffer == "2.", solo pasan los dígitos
-        (la fracción es obligatoria); con "2e" pasan dígitos y +/-. Esto NO
-        se puede derivar de los dos booleanos number_has_digit/number_has_dot
-        del plan: necesita la cadena acumulada (ver Q&A de diseño).
+        Probes each grammar character against the prefix regex: with
+        ``number_buffer == "2."`` only digits pass (the fraction is
+        mandatory); with ``"2e"`` digits and ``+/-`` pass. This cannot be
+        derived from a pair of has_digit/has_dot booleans: the
+        accumulated string itself is what decides — two booleans cannot
+        express every grammar position (e.g. leading zeros: "01" must
+        fail, and "0." must not).
         """
         if not self.number_buffer:
             return {"-", *(_DIGITS)}

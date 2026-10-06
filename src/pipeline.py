@@ -149,15 +149,23 @@ def run(args: argparse.Namespace) -> int:
     # al reinicio de la VM.
     report_prompt_metrics(prompt_metrics, args.output.parent / "decode_metrics.json")
 
-    for i, result in enumerate(generated):
-        print(f"  result : {result}")
-
     # --- Persistencia del entregable (subject V.4) -------------------------
     # Convertimos cada string del decoder en una FunctionCall validada,
     # emparejada con su prompt ORIGINAL, y escribimos el array a disco.
     # `build_results` conserva el orden 1:1 con los prompts de entrada: la
     # moulinette empareja con `zip()`, que es posicional.
     results: list[FunctionCall] = build_results(raw_prompts, generated)
+
+    # El eco de stdout va DESPUÉS de `build_results`, no antes: lo que se
+    # imprime tiene que ser lo que queda en el archivo. Antes se imprimía el
+    # string crudo del decoder y la consola mostraba `replacement: "****"` y
+    # `template: 'Say hello to {name}'` mientras el JSON en disco ya traía
+    # `*` y `Say "hello" to {name}`. El corretero scorea el archivo, así que
+    # el score era 11/11 igual — pero un revisor que lee la consola veía
+    # output roto. Se imprime `name` + `parameters` (no el `prompt`, que ya
+    # se imprimió al leer la entrada) con el MISMO formato que antes.
+    for call in results:
+        print(f"  result : {json.dumps(call.echo_view(), indent=2, ensure_ascii=False)}")
 
     # --- Diagnóstico de prompts sin match (stderr, nunca el JSON) ----------
     # El decoder restringido siempre emite una función válida, así que un

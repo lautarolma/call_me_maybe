@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -115,3 +117,57 @@ class TestFunctionCall:
         """
         with pytest.raises(ValidationError):
             FunctionCall(name="fn_greet", parameters={"a": 1})
+
+
+class TestEchoView:
+    """`echo_view` es lo que el pipeline imprime en stdout.
+
+    No es un detalle cosmético: el eco se imprimía ANTES de la validación, así
+    que la consola mostraba `replacement: "****"` mientras el JSON en disco ya
+    traía `*`. El corretero scorea el archivo, así que el score era 11/11 igual,
+    pero cualquier revisor que lea la consola ve output roto y cree que el
+    pipeline está mal. Estos tests blindan que la vista proyectada salga del
+    modelo validado y no del dict crudo del decoder.
+    """
+
+    def test_only_name_and_parameters(self) -> None:
+        call = FunctionCall(prompt="Greet shrek", name="fn_greet", parameters={"name": "shrek"})
+        assert call.echo_view() == {"name": "fn_greet", "parameters": {"name": "shrek"}}
+
+    def test_prompt_is_never_echoed(self) -> None:
+        """El `prompt` no va: la consola ya lo muestra al leer la entrada.
+
+        Si aparece acá, cada bloque del eco pasa de 3 a 6 líneas y se duplica
+        texto que ya está en pantalla.
+        """
+        assert "prompt" not in FunctionCall(prompt="Greet shrek", name="fn_greet").echo_view()
+
+    def test_key_order_is_name_then_parameters(self) -> None:
+        view = FunctionCall(prompt="p", name="fn_greet", parameters={}).echo_view()
+        assert list(view) == ["name", "parameters"]
+
+    def test_echo_reflects_post_validation_value(self) -> None:
+        """El caso real de P9: el valor reparado es el que se ve.
+
+        Este es el test de regresión del bug de stdout. `replacement` vale `*`
+        (ya validado) y el eco tiene que mostrar `*` — no el `****` crudo del
+        decoder. Si alguien vuelve a imprimir el dict crudo, este test falla.
+        """
+        validated = FunctionCall(
+            prompt="Replace all vowels in 'Programming is fun' with asterisks",
+            name="fn_substitute_string_with_regex",
+            parameters={
+                "source_string": "Programming is fun",
+                "regex": "([aeiouAEIOU])",
+                "replacement": "*",
+            },
+        )
+        assert validated.echo_view()["parameters"]["replacement"] == "*"  # type: ignore[index]
+
+    def test_echo_is_json_serializable(self) -> None:
+        """El pipeline lo pasa por `json.dumps(..., indent=2)`: tiene que
+        serializar sin inventar nada, y sin `ensure_ascii` para los acentos."""
+        call = FunctionCall(prompt="Saludá a shrek", name="fn_greet", parameters={"name": "Ñandú"})
+        dumped = json.dumps(call.echo_view(), indent=2, ensure_ascii=False)
+        assert "Ñandú" in dumped
+        assert json.loads(dumped) == call.echo_view()

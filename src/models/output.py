@@ -49,3 +49,18 @@ class FunctionCall(BaseModel):
         default_factory=dict,
         description="Function arguments",
     )
+
+    def echo_view(self) -> dict[str, object]:
+        """Proyecta la entry a la vista ``name`` + ``parameters`` del eco.
+
+        Deliberadamente NO es ``model_dump()``: ese incluye ``prompt``, que la
+        consola ya usó para mostrar la entrada y que convertiría cada bloque de
+        3 líneas en uno de 6. Tampoco es el dict crudo del decoder — se llama
+        DESPUÉS de la validación, así que el valor que se ve en pantalla es el
+        mismo que queda en el archivo, incluidas las reparaciones post-hoc
+        (comillas internas, corridas de caracteres repetidos).
+
+        Returns:
+            Dict de dos claves, en el orden en que las imprime el eco.
+        """
+        return {"name": self.name, "parameters": self.parameters}

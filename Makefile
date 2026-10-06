@@ -1,4 +1,4 @@
-.PHONY: install run debug clean lint lint-strict test
+.PHONY: install run debug clean lint test
 
 install:
 	uv sync
@@ -15,10 +15,6 @@ clean:
 	rm -rf tests/__pycache__
 
 lint:
-	uv run flake8 .
-	uv run mypy . --warn-return-any --warn-unused-ignores --ignore-missing-imports --disallow-untyped-defs --check-untyped-defs
-
-lint-strict:
 	uv run flake8 .
 	uv run mypy . --strict
 

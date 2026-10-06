@@ -2,68 +2,36 @@
 
 from __future__ import annotations
 
-# `Literal` (PEP 586, typing): restringe un valor a un conjunto CERRADO de
-# literales exactos. A diferencia de `str` (acepta cualquier string),
-# Literal["string", "number"] solo acepta esos 4 valores EXACTOS.
-# Doble función: documentación para humanos + chequeo estático (mypy) +
-# validación en RUNTIME cuando lo usa pydantic. Si el JSON trae "integer",
-# la validación explota con un mensaje que lista los valores válidos.
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-#: Allowed JSON types for function parameters.
-#: Solo los tipos ESCALARES de JSON entran en el MVP. Los compuestos
-#: (objects/dicts y arrays) quedan FUERA del scope del proyecto a propósito:
-#: validar y hacer constrained decoding de un parámetro anidado requiere una
-#: máquina de estados + schema recursivo mucho más complejo.
-#: ⭐ BONUS B8 ("complex nested function arguments"): para habilitarlo, agregar
-#: "object" y "array" a este Literal y extender FunctionDef/schema_validator
-#: para manejar tipos anidados. NO tocar hasta que el MVP esté verde.
+#: Allowed JSON scalar types for function parameters.
+#: Only scalars are in scope: constrained-decoding nested objects/arrays
+#: needs a recursive schema and a much larger state machine (the subject's
+#: "complex nested function arguments" bonus turns them on — leave it off
+#: until the MVP is green).
 #:
-#: ⚠️ POR QUÉ "integer" ESTÁ ACÁ Y NO ES UN TIPO DE JSON (no lo borres):
-#: "integer" NO existe en el spec de JSON — hay UN solo tipo numérico. Es una
-#: distinción de la MOULINETTE (extract_functions_infos.TYPE_MAP mapea
-#: `int` → "integer" y `float` → "number"), y aparece en las definiciones
-#: PRIVADAS (`fn_is_even.n`, `fn_calculate_compound_interest.years`).
-#: Sin este Literal, `load_functions` explota con `literal_error` sobre el
-#: set privado y el programa NO ARRANCA: 0 en la mitad de la evaluación.
-#: Ojo con el efecto dominó: aceitar el Literal NO alcanza. El decoder compara
-#: el tipo declarado contra el kind del token (schema_validator.
-#: `_allows_value_type`) y todo token numérico declara kind "number"; con
-#: `==` un "integer" declarado haría que NINGÚN token fuera válido → cuelgue
-#: en vez de crash. Por eso el decoder tiene que comparar por COMPATIBILIDAD
-#: (`_declared_type_accepts`), no por igualdad. Ver schema_validator.py.
+#: Why "integer" is here, although JSON has no such type: the moulinette's
+#: extractor spells a Python int as "integer" (float -> "number") and the
+#: private function set uses it. Without this member ``load_functions``
+#: fails Literal validation and the program cannot start on the private
+#: half of the evaluation. Domino effect: accepting it here is not enough —
+#: every numeric token declares kind "number", so an equality check would
+#: accept no token and hang the decoder; ``schema_validator`` therefore
+#: compares declared types by compatibility, not equality.
 ParameterType = Literal["string", "number", "integer", "boolean", "null"]
 
 
 class ParameterDef(BaseModel):
-    """A single function parameter.
+    """A single function parameter: name and declared JSON type."""
 
-    QUÉ ES BaseModel (por dentro):
-    - Cuando definís una clase que hereda de BaseModel, la metaclass de
-      pydantic inspecciona las anotaciones en tiempo de DEFINICIÓN y construye
-      un schema interno (core schema en Rust en pydantic v2). Con eso genera
-      un __init__ que VALIDA Y COERCIONA cada argumento: si pasa `"type": 42`
-      a ParameterDef, no llega a asignarse — lanza ValidationError.
-    - Los modelos son (por default) inmutables-ish: validar después de crear
-      requiere model_copy o desactivar validate_assignment.
-    """
-
-    # ``name`` mirrors the dict key in ``FunctionDef.parameters`` and is kept
-    # in sync by ``FunctionDef._sync_parameter_names`` after validation.
-    #
-    # ¿Por qué existe este campo si ya es la key del dict? DENORMALIZACIÓN
-    # deliberada: al recorrer luego los parámetros como lista de objetos,
-    # cada objeto se describe completo sin necesitar contexto externo
-    # ("¿cómo me llamo?"). El costo es mantener la copia sincronizada — y
-    # ese trabajo lo hace el validator de FunctionDef, no el consumidor.
-    #
-    # Field() es el configurador de campos de pydantic: default, alias,
-    # constraints (ge/le/min_length...), description (que termina en el JSON
-    # schema generado). Acá: default="" porque el JSON de entrada NO trae
-    # "name" dentro del parameter (viene como key del dict padre); sin el
-    # default, la validación fallaría antes de llegar al sincronizador.
+    # name mirrors the dict key in FunctionDef.parameters, synced by
+    # FunctionDef._sync_parameter_names: deliberate denormalization so a
+    # parameter object is self-describing when iterated as a list. The
+    # default "" matters because the input JSON carries the name as the
+    # parent dict's key, not inside the parameter — without it, validation
+    # would fail before the syncer runs.
     name: str = Field(default="", description="Parameter name")
     type: ParameterType = Field(
         description=(
@@ -75,39 +43,25 @@ class ParameterDef(BaseModel):
 
 
 class FunctionDef(BaseModel):
-    """A function definition as found in functions_definition.json."""
+    """A function definition as found in ``functions_definition.json``."""
 
     name: str = Field(description="Function name, e.g. 'fn_add_numbers'")
     description: str = Field(description="Human-readable description")
-    # dict[str, ParameterDef]: pydantic valida RECURSIVAMENTE. Cada valor del
-    # dict se valida contra el modelo ParameterDef completo. Un dict anidado
-    # malformado reporta el error con la ruta exacta (parameters -> altura).
     parameters: dict[str, ParameterDef] = Field(
         description="Parameter name -> validated {type: ...} definition"
     )
     returns: dict[str, str] = Field(description="Return type info")
 
-    # @field_validator("parameters", mode="after"):
-    #   Registra este método como validador del campo "parameters".
-    #   mode="after" significa: se ejecuta DESPUÉS de que pydantic validó y
-    #   convirtió el valor crudo (dict de dicts -> dict de ParameterDef).
-    #   Por eso la firma recibe dict[str, ParameterDef] ya tipado y podemos
-    #   mutar objetos ParameterDef reales, no dicts crudos.
-    #   (mode="before" recibiría el JSON crudo y serviría para pre-procesar.)
-    #
-    # @classmethod es OBLIGATORIO en la API de pydantic v2 para validators:
-    # el validador se invoca sobre la clase (cls) porque puede correr antes
-    # de que exista la instancia.
     @field_validator("parameters", mode="after")
     @classmethod
     def _sync_parameter_names(
         cls, params: dict[str, ParameterDef]
     ) -> dict[str, ParameterDef]:
         """Keep each ParameterDef.name in sync with its dict key."""
-        # items() devuelve pares (key, value) del dict; asignamos param.name
-        # pisando el default "". Como el validador corre dentro del proceso
-        # de construcción del modelo, NINGÚN consumidor puede ver el estado
-        # dessincronizado: o el modelo se construye bien, o no se construye.
+        # mode="after" runs AFTER pydantic's own validation has turned the
+        # raw JSON {"n": {...}} into real ParameterDef instances — which is
+        # exactly what this loop needs, since it assigns param.name on
+        # those instances. mode="before" would still see plain dicts.
         for key, param in params.items():
             param.name = key
         return params

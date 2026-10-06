@@ -4,63 +4,43 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-#: Any JSON value that can appear inside the ``parameters`` object.
-#
-# Union type con sintaxis PEP 604 (Python 3.10+): equivale a
-# Union[str, int, float, bool, None] de typing. Describe EXACTAMENTE el
-# conjunto de valores que JSON puede representar como escalar (JSON no tiene
-# tipos fecha/tupla/etc.: todo son estos 5 + arrays + objects).
-# Nota de tipado: en Python `bool` es subclase de `int`, así que un validador
-# estricto que distinga True de 1 debe chequear bool ANTES que int.
+#: Any JSON scalar that can appear inside ``parameters``: string, int,
+#: float, bool or null (scalars only — nested lists/objects are out of
+#: scope). Note bool is a subclass of int in Python, so a strict
+#: validator must check bool before int.
 JSONValue = str | int | float | bool | None
 
 
 class FunctionCall(BaseModel):
     """A single function call produced for one input prompt.
 
-    Este modelo representa la SALIDA del sistema: lo que el decoder
-    restringido va a producir por cada prompt y que después se serializa a
-    function_calling_results.json. Al modelarlo con pydantic ganamos gratis:
-    - validación al construir (si el generador produce basura, explode acá)
-    - serialización a dict/JSON con .model_dump() / .model_dump_json()
-
-    ORDEN DE LOS CAMPOS: importa solo por legibilidad del JSON resultante
-    (pydantic serializa en orden de declaración), no semánticamente — el
-    orden de keys en un objeto JSON es irrelevante para `json.load`. El
-    orden prompt → name → parameters replica el ejemplo del subject (V.4.1).
+    The output side of the system: what the constrained decoder emits per
+    prompt and what gets serialized to ``function_calling_results.json``.
+    Pydantic buys validation at construction (garbage from the generator
+    fails here) and serialization via ``model_dump()``. Field order is
+    readability only — it mirrors the subject's example output; JSON
+    object key order carries no semantics.
     """
 
     prompt: str = Field(
         description="Original natural-language request, verbatim from the input file"
     )
     name: str = Field(description="Name of the function to call")
-
-    # ¿Por qué default_factory=dict y NO parameters: dict = {}? Porque los
-    # defaults mutables se evalúan UNA vez (al definir la clase) y serían
-    # COMPARTIDOS entre todas las instancias: mutar el dict de una "instancia"
-    # mutaría el de todas — bug clásico de Python (el famoso mutable default).
-    # default_factory recibe el callable y lo LLAMA en cada construcción,
-    # produciendo un dict fresco por instancia.
-    #
-    # El tipo del value es JSONValue (la union de arriba): un parámetro puede
-    # valer "pepe", 42, 3.14, true o null, pero nunca una lista anidada ni
-    # otro objeto — el scope del proyecto limita parámetros a escalares.
     parameters: dict[str, JSONValue] = Field(
         default_factory=dict,
         description="Function arguments",
     )
 
     def echo_view(self) -> dict[str, object]:
-        """Proyecta la entry a la vista ``name`` + ``parameters`` del eco.
+        """Project the entry to the echo's ``name`` + ``parameters`` view.
 
-        Deliberadamente NO es ``model_dump()``: ese incluye ``prompt``, que la
-        consola ya usó para mostrar la entrada y que convertiría cada bloque de
-        3 líneas en uno de 6. Tampoco es el dict crudo del decoder — se llama
-        DESPUÉS de la validación, así que el valor que se ve en pantalla es el
-        mismo que queda en el archivo, incluidas las reparaciones post-hoc
-        (comillas internas, corridas de caracteres repetidos).
+        Deliberately not ``model_dump()``: that would also print
+        ``prompt``, which the console already showed, doubling every echo
+        block. And not the decoder's raw dict either — this runs after
+        validation, so what is on screen equals what is persisted,
+        post-hoc repairs included.
 
         Returns:
-            Dict de dos claves, en el orden en que las imprime el eco.
+            A two-key dict, in the order the echo prints it.
         """
         return {"name": self.name, "parameters": self.parameters}

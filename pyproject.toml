@@ -36,6 +36,10 @@ packages = ["src"]
 
 [tool.mypy]
 python_version = "3.10"
+# Subject IV.2 mandates the lint flag list on the Makefile and strongly
+# recommends --strict; setting it here layers strict on EVERY mypy run
+# (the Makefile keeps executing the mandated commands verbatim).
+strict = true
 ignore_missing_imports = true
 # llm_sdk is a provided third-party package with no type stubs, and tests/
 # are not graded by the subject — exclude both from direct checking (analogous

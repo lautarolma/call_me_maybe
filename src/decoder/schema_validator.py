@@ -1,37 +1,13 @@
-"""Schema-aware validation del constrained JSON decoder (Task 3.3).
+"""Schema-aware validation for the constrained JSON decoder.
 
-POR QUÉ EXISTE ESTE MÓDULO (por dentro):
-- La state machine (state.py) valida SINTAXIS: "cualquier string bien formado".
-  El schema validator valida SEMÁNTICA: qué keys son válidas, qué tipo de
-  value espera cada una, y qué required keys faltan antes de cerrar
-  parameters. Es la otra mitad de la distinción sintaxis ↔ semántica
-  documentada en TeoricNotes.
-- Es la contracara del trie: el trie restringe el value de "name" a nombres
-  de función existentes (Task 3.4, Fase 3). SchemaContext TOMA ese nombre y
-  resuelve la función seleccionada; a partir de ahí valida los parámetros
-  (keys, tipos, required).
+This module validates the semantic constraints on top of the FSM syntax:
+which function name is allowed (by the trie), which parameter keys exist
+and are not duplicated, whether a value matches the declared parameter
+type, whether parameters can be closed with all required keys present,
+and the exact form of integer literals.
 
-DE DÓNDE SALE EL NOMBRE SELECCIONADO (decisión de diseño):
-- update(state) recibe SOLO el estado (firma EXACTA del plan, sin
-  token_text). El texto del value de "name" lo acumula la STATE MACHINE en
-  state.name_buffer (⚠ desvío documentado en state.py, mismo espíritu que
-  keys_enclosed: bookkeeping que el schema lee).
-- ¿Por qué en la state machine y no acá? Un token BPE puede mezclar
-  estructura y contenido ('fn_add_numbers", "parameters": {'): cuando la
-  resolución debería dispararse, el estado post-token ya tiene otra key en
-  current_key. Reconstruir el span del name desde el estado post-token
-  obligaría a re-simular el token. La state machine ve los chars en
-  contexto: es la única fuente confiable y encima simplifica Task 3.4
-  (allows_token puede usar new_state.name_buffer con el trie directo).
-
-QUÉ NO HACE (separación de concerns):
-- No toca el trie (trie.py) ni el pre-filtro (Task 3.4). Solo conoce la
-  función seleccionada, sus parámetros (keys + tipos) y las keys ya emitidas.
-
-NOTA sobre el acceptance criteria del plan ("state en VALUE_START"):
-- VALUE_START es el estado INALCANZABLE (el plan A6.3 lo reservaba; la
-  implementación saltea directo al estado de value concreto). Los tests usan
-  las fases reales: COLON / IN_STRING_VALUE / IN_NUMBER_VALUE / etc.
+The schema does not inject syntax. It only decides whether a model-proposed
+token is allowed given the current semantic context.
 """
 
 from __future__ import annotations
@@ -40,8 +16,8 @@ from src.decoder.state import DecoderPhase, DecoderState
 from src.decoder.trie import TrieNode, find_node, is_complete_name
 from src.models.function_definition import FunctionDef
 
-# Fases en las que se está LEYENDO un value (o a punto de arrancarlo en COLON).
-# En estas fases current_key ya se definió y el tipo esperado aplica.
+# Phases in which a value is being read, or about to start at COLON.
+# In these phases, the current key is defined and an expected type may apply.
 _VALUE_READ_PHASES = (
     DecoderPhase.COLON,
     DecoderPhase.IN_STRING_VALUE,
@@ -51,8 +27,8 @@ _VALUE_READ_PHASES = (
     DecoderPhase.ESCAPE_IN_STRING,
 )
 
-# Fases de value "puro" (string/number/bool/null): sirven para detectar si un
-# token ENTRÓ a un value en este step (pre no estaba acá, post sí).
+# Phases that represent an active scalar value. Used to detect when a token
+# enters a value in the current step (pre-state not in this set, post-state is).
 _VALUE_PHASES = (
     DecoderPhase.IN_STRING_VALUE,
     DecoderPhase.IN_NUMBER_VALUE,
@@ -61,16 +37,15 @@ _VALUE_PHASES = (
     DecoderPhase.ESCAPE_IN_STRING,
 )
 
-# Fases en las que el decoder está DENTRO del value de la key "name" del
-# output object (depth 0), o a punto de arrancarlo (COLON ya definió la key).
-# El filtro (Task 3.4) las usa para aplicar el trie (Fase 3, cláusula 1).
+# Phases in which the decoder is reading the value of the output object's
+# "name" key (depth 0), or about to start it (COLON already set the key).
 _NAME_READ_PHASES = (
     DecoderPhase.COLON,
     DecoderPhase.IN_STRING_VALUE,
     DecoderPhase.ESCAPE_IN_STRING,
 )
 
-# Tipo JSON declarado por cada fase de value en curso (cláusula 3: value type).
+# JSON kind declared by the current value phase (for the type gate).
 _PHASE_KIND: dict[DecoderPhase, str] = {
     DecoderPhase.IN_STRING_VALUE: "string",
     DecoderPhase.ESCAPE_IN_STRING: "string",
@@ -79,11 +54,8 @@ _PHASE_KIND: dict[DecoderPhase, str] = {
     DecoderPhase.IN_NULL_VALUE: "null",
 }
 
-# Tipo JSON declarado por el PRIMER carácter de un value que arranca en COLON
-# (mismo set de chars que expected_first_chars en COLON, menos '{' = objeto).
-# Cubre el value que se abre Y se cierra dentro del MISMO token ('2,', 'true}',
-# '"x",'): en ese caso el post-state no queda en una fase de value y el tipo
-# hay que leerlo del texto.
+# JSON kind inferred from the first character of a value that opens at COLON
+# and is closed within the same token (e.g. '2,', 'true}', '"x",').
 _VALUE_START_KINDS: dict[str, str] = {
     '"': "string",
     "-": "number",
@@ -93,60 +65,41 @@ _VALUE_START_KINDS: dict[str, str] = {
     "n": "null",
 }
 
-# Tipos PARÁMETRO que el decoder trata como numéricos.
-#
-# ⭐ LA REGLA: JSON tiene UN SOLO tipo numérico — "integer" no existe en el
-# spec. Es la manera que tiene la moulinette de decir "este parámetro es un int
-# de Python" (extract_functions_infos.TYPE_MAP: int→"integer", float→"number"),
-# y aparece en las definiciones PRIVADAS (`fn_is_even.n`,
-# `fn_calculate_compound_interest.years`).
-#
-# Por lo tanto un literal numérico (`2`, `2.0`, `-1e3`) es SINTÁCTICAMENTE
-# válido para los dos tipos declarados, y la cláusula 3 solo chequea la
-# FAMILIA. La FORMA del literal (int vs float de Python) la imponen dos piezas
-# aparte: la cláusula 5 (`_allows_integer_form`) prohíbe '.', 'e' y 'E' en un
-# "integer", y el generator inyecta '.0' cuando un "number" cierra como entero.
-# No se puede dejar a la frontera de salida: `4.5` para un integer no tiene
-# cast válido, y `2` vs `2.0` son secuencias de tokens distintas.
-#
-# Confundir esas dos capas es lo que hace que un `==` directo sea un bug: todo
-# token numérico declara kind "number" (ver _PHASE_KIND y _VALUE_START_KINDS),
-# así que con igualdad un parámetro declarado "integer" rechazaría CADA token
-# candidato → allowed set vacío → el decoder se cuelga.
+# Parameter types treated as numeric. JSON has only "number"; the "integer"
+# type is a project-specific constraint (the evaluator expects int values).
 _NUMERIC_PARAM_TYPES = frozenset({"number", "integer"})
 
 
 def _declared_type_accepts(kind: str, declared: str) -> bool:
-    """¿Un token de kind `kind` es válido para un parámetro declarado `declared`?
+    """Return True if a token kind is acceptable for a declared parameter type.
 
-    Sustituye al `kind == declared` directo de la cláusula 3 para que los tipos
-    numéricos se traten como UNA familia:
+    Numeric kinds are treated as a family: both "number" and "integer"
+    accept a numeric token kind. The exact literal form for "integer"
+    (no '.', 'e', 'E') is enforced separately.
 
-        _declared_type_accepts("number", "number")   -> True
-        _declared_type_accepts("number", "integer")  -> True   <- el fix de P0
-        _declared_type_accepts("string", "number")   -> False
-        _declared_type_accepts("number", "string")   -> False
-        _declared_type_accepts("boolean", "number")  -> False
+    Args:
+        kind: The JSON kind inferred from the token/value phase.
+        declared: The parameter type declared in the schema.
 
-    Sólo se relaja el eje numérico: acá los dos aceptan la familia numérica.
-    La forma exacta del literal para "integer" la restringe la cláusula 5.
+    Returns:
+        True if the kind matches the declared type under the numeric family rule.
     """
     if kind == "number":
         return declared in _NUMERIC_PARAM_TYPES
     return kind == declared
 
 
-#: Terminadores de un literal numérico: cierran el value en curso.
+# Terminators that close a numeric literal.
 _NUMBER_TERMINATORS = frozenset(",} \t\n\r")
 
 
 class SchemaContext:
-    """Estado semántico del decoder: función seleccionada + contexto de params.
+    """Semantic context for constrained decoding.
 
-    NO es un @dataclass a propósito: este objeto se actualiza UNA vez por
-    step de generación (no se copia por candidato como DecoderState), así
-    que no necesita __eq__/__repr__ generados ni default factories. Un
-    __slots__ manual alcanza y deja el contrato explícito.
+    Tracks the selected function and parameter context (current key, depth,
+    and which parameter keys have been enclosed). This object is updated
+    once per generation step (not copied per candidate), so it uses
+    explicit slots rather than a dataclass.
     """
 
     __slots__ = (
@@ -160,32 +113,34 @@ class SchemaContext:
     )
 
     def __init__(self, functions: list[FunctionDef]) -> None:
-        # Índice name -> FunctionDef: el loader ya rechaza duplicados
-        # (BUG-002), acá la construcción es directa.
+        """Initialize the schema context with function definitions.
+
+        Args:
+            functions: List of available functions; names must be unique.
+        """
         self._index = {fn.name: fn for fn in functions}
         self._current_key = ""
         self._depth = 0
         self._keys_enclosed: set[str] = set()
         self._phase = DecoderPhase.ROOT
-        #: True si el recorrido pasó por PARAMS_OBJECT (el '{' de "parameters").
-        #: Lo setea update() y lo consume el pase fino del generator (Inciso
-        #: 4.1.1): cierra el gap del plan "output object sin parameters".
+        # True if the path has passed through the "parameters" object.
         self._params_object_seen = False
-        #: Función elegida por el value de "name" (None hasta resolverse).
+        # Selected function resolved from the "name" value.
         self.selected_function: FunctionDef | None = None
 
     # ------------------------------------------------------------------ API
 
     def update(self, state: DecoderState) -> None:
-        """Refresca el contexto desde el estado commiteado del decoder.
+        """Refresh the context from the committed decoder state.
 
-        SE LLAMA UNA vez por step (no por candidato): el filter NO muta el
-        schema en Fase 3, solo lee. La mutación vive únicamente acá.
+        Called once per generation step (not per candidate). The filter
+        reads the schema; mutations occur only here.
+
+        Args:
+            state: The decoder state to read from.
         """
         self._phase = state.phase
         self._current_key = state.current_key
-        # keys_enclosed del estado ya viene como set nuevo reemplazado
-        # (nunca mutado in-place) — copiar es gratis y evita aliasing raro.
         self._keys_enclosed = set(state.keys_enclosed)
         self._depth = state.depth
         if state.phase is DecoderPhase.PARAMS_OBJECT:
@@ -193,61 +148,55 @@ class SchemaContext:
         self._resolve_function(state)
 
     def current_expected_type(self) -> str | None:
-        """Tipo esperado para el value en curso, o None si no aplica.
+        """Return the expected JSON type for the current value, or None if none.
 
-        - Key "name" del output object (depth 0) → siempre "string".
-        - Parámetro de la función seleccionada (depth 1) → su tipo en el
-          schema.
-        - Cualquier otra cosa ("parameters" object, key desconocida,
-          función aún no seleccionada, o posición donde no se lee un
-          value) → None (sin constraint).
+        - Output object key "name" (depth 0): "string".
+        - Parameter of the selected function (depth 1): the declared parameter type.
+        - Otherwise (parameters object, unknown key, no function selected,
+          or not reading a value): None (no constraint).
+
+        Returns:
+            The expected type name, or None.
         """
         if self._phase not in _VALUE_READ_PHASES:
             return None
         if self._depth == 0:
-            # El value de "name" es string; "parameters" es un objeto sin
-            # tipo escalar (lo validan las cláusulas de estructura, no el tipo).
             return "string" if self._current_key == "name" else None
-        # depth == 1: value de un parámetro de la función seleccionada.
         if self.selected_function is None:
             return None
         param = self.selected_function.parameters.get(self._current_key)
         return param.type if param is not None else None
 
     def required_keys_remaining(self) -> set[str]:
-        """Required keys de parameters que todavía no se emitieron.
+        """Return required parameter keys not yet enclosed.
 
-        En este MVP TODOS los parámetros son required (el JSON de entrada no
-        distingue required/opcional). Como las keys ya emitidas NO pueden
-        repetirse, este mismo set es el de "keys válidas para el próximo
-        key": el filter (Task 3.4) lo usa para bloquear keys inexistentes o
-        duplicadas.
+        In this MVP all parameters are required. This set also defines
+        valid candidate keys (those that exist and have not been duplicated).
+
+        Returns:
+            Set of remaining required parameter names.
         """
         if self.selected_function is None:
             return set()
         return set(self.selected_function.parameters) - self._keys_enclosed
 
     def all_required_present(self) -> bool:
-        """True si TODOS los required keys ya fueron emitidos.
+        """Return True if all required keys have been enclosed.
 
-        Si no hay función seleccionada devuelve False (conservador): no se
-        puede afirmar que un parameters object puede cerrarse sin saber qué
-        keys exige.
+        Returns False if no function is selected (conservative).
         """
         return self.selected_function is not None and not self.required_keys_remaining()
 
     def can_close_params(self) -> bool:
-        """True si el '}' de cierre de parameters está permitido ahora."""
+        """Return True if the closing '}' of the parameters object is allowed."""
         return self.all_required_present()
 
     def has_seen_params_object(self) -> bool:
-        """True si el recorrido pasó por el '{' del objeto "parameters".
+        """Return True if the decoder has seen the '{' of the "parameters" object.
 
-        LO CONSUME EL PASO FINO del generator (Inciso 4.1.1): cuando el
-        estado llega a COMPLETE, exige que este flag esté encendido. Cierra
-        el gap del plan "output object sin parameters" ('{"name":"fn"}'
-        completo sin el objeto parameters jamás se emite). El flag lo setea
-        update() cuando ve PARAMS_OBJECT (solo el '{' lo produce).
+        Used by the fine pass: when the state reaches COMPLETE, the generator
+        may require this flag to be set. It is set in update() when the phase
+        becomes PARAMS_OBJECT.
         """
         return self._params_object_seen
 
@@ -256,64 +205,26 @@ class SchemaContext:
     def allows_token(
         self, token_text: str, new_state: DecoderState, trie: TrieNode
     ) -> bool:
-        """Semántica de UN token candidato: True si el schema lo permite.
+        """Return True if the schema allows applying/adopting the candidate token.
 
-        QUÉ ES (por dentro):
-        - PURA: NO muta este SchemaContext. El filter (Task 3.4) la llama por
-          cada candidato en Fase 3; acá SOLO se lee el snapshot commiteado del
-          último update(state) (self._phase/_current_key/_depth/_keys_enclosed)
-          + el estado SIMULADO new_state que el filter acaba de producir.
-        - CINCO cláusulas ANDed. Para leerlas de un vistazo:
-            1. _allows_name_value   → el value de "name" tiene que ser un
-               nombre de función del trie. Trigga en la fase del name.
-               BLOQUEA: un value que no matchea ninguna función.
-            2. _allows_param_key    → las keys de "parameters" existen en el
-               schema y no están repetidas. Trigga por CAMBIO del texto de
-               la key. BLOQUEA: key inexistente o duplicada.
-            3. _allows_value_type   → el value de un parámetro tiene que
-               coincidir con el tipo declarado. Trigga cuando el token ABRE
-               un value en depth 1. BLOQUEA: un string donde se espera
-               number, un number donde se espera string.
-            4. _allows_params_close → el '}' que cierra "parameters" solo si
-               ya están todas las keys requeridas. Trigga por el salto de
-               depth 1 → 0. BLOQUEA: cerrar con required faltantes.
-            5. _allows_integer_form → un parámetro declarado "integer" no
-               admite '.', 'e' ni 'E'. Trigga en COLON o dentro de
-               IN_NUMBER_VALUE. BLOQUEA: 4.0 o 1e3 donde la moulinette
-               hace assert isinstance(n, int).
-        - El parámetro token_text (firma del plan) lo usan SOLO las cláusulas
-          3 y 5 (primer char de un value que abre Y cierra en el mismo
-          token). El resto trabaja con fases y buffers: justamente el punto
-          del desvío name_buffer (Task 3.3) — el schema no re-parsea.
+        This is a pure predicate: it does not mutate the schema context.
+        The filter calls it once per candidate using the last committed
+        snapshot (self) and the simulated post-state (new_state).
 
-        GAPS (scope del plan, deliberados):
-        - El '}' de cierre del OUTPUT object (depth 0 → COMPLETE) NO se gatea
-          acá: el plan solo bloquea el cierre de parameters. Consecuencia:
-          '{"name":"fn"}' sin "parameters" se completa (el schema no exige
-          presence del key "parameters").
-        - Las keys del output object ("name"/"parameters") NO se validan como
-          keys: "parameters" con value string, o un "extra" al nivel superior,
-          pasan la semántica (la sintaxis y el trie hacen lo suyo).
-        - Values anidados (depth >= 2) escapan a estas cláusulas: el plan solo
-          modela parámetros escalares de UN nivel (B8 futuro). La state
-          machine ni siquiera sensa bien el depth a partir de 2.
-        - El CONTENIDO de un value "string" no está restringido en absoluto.
-          La cláusula 3 sabe que la fase es IN_STRING_VALUE y que el tipo
-          declarado es "string", así que la comprobación se cumple y sigue:
-          nunca mira los caracteres de adentro. Consecuencia medible: durante
-          la generación del value de un parámetro tipo string, las cinco
-          cláusulas abstienen y el contenido sale por argmax libre sobre el
-          vocabulario completo. Es correcto por diseño — el schema declara
-          el TIPO, no un formato ni un patrón — pero conviene saberlo: no hay
-          ninguna red detrás de lo que el modelo escriba dentro de un string,
-          y no la puede haber sin parsear el valor.
-        - Un ESCAPE dentro del value de "name" NO queda bloqueado por el
-          trie "por construcción" (BUG-011): los escapes se skippean del
-          buffer en state.py, así que name_buffer no cambia y el prefijo
-          sigue siendo válido para siempre. El guard vive en
-          `state.py._step_string` (rechaza el '\\' al leerlo), NO acá: una
-          cláusula a nivel de token completo es ciega a un escape fusionado
-          en 1-2 tokens BPE que resuelve la fase internamente.
+        The check is the AND of five clauses:
+        1. _allows_name_value: the "name" value must be a valid function name.
+        2. _allows_param_key: parameter keys must exist and not be duplicated.
+        3. _allows_value_type: a parameter value must match the declared type.
+        4. _allows_params_close: closing '}' of parameters requires all required keys.
+        5. _allows_integer_form: integer parameters forbid '.', 'e', 'E'.
+
+        Args:
+            token_text: Text of the candidate token.
+            new_state: Simulated decoder state after applying the token.
+            trie: Trie of allowed function names.
+
+        Returns:
+            True if the token is allowed by schema constraints.
         """
         if not self._allows_name_value(new_state, trie):
             return False
@@ -330,19 +241,14 @@ class SchemaContext:
     # ------------------------------------------------------ name resolution
 
     def _resolve_function(self, state: DecoderState) -> None:
-        """Resuelve selected_function cuando el name del output object está.
+        """Resolve selected_function when the output object's "name" value is known.
 
-        Regla por BUFFER, no por fase: cualquier name_buffer no vacío es el
-        value de "name" del output object (la state machine solo acumula en
-        depth 0 con key "name"; el parámetro "name" de fn_greet vive en
-        depth 1 y no entra). El buffer sobrevive al cierre del name aunque
-        el MISMO token siga con estructura ("parameters"...): por eso la
-        resolución no depende de dónde quedó el estado post-token.
-        - Si el buffer es un PREFIJO parcial (fn_get_s), _index.get da None
-          y se espera al próximo step (el trie ya garantiza prefix-validity).
-        - Si es un nombre COMPLETO aunque el string no se haya cerrado aún,
-          resolver temprano es correcto: el trie no permite extender un
-          nombre completo (valid_next_chars == set()).
+        Resolution is based on the name buffer (not phase): any non-empty
+        name_buffer from the FSM is the "name" value at depth 0. The buffer
+        persists even if the same token moves to subsequent structure.
+
+        Args:
+            state: Decoder state containing name_buffer.
         """
         if self.selected_function is not None:
             return
@@ -355,44 +261,20 @@ class SchemaContext:
     def _allows_name_value(
         self, new_state: DecoderState, trie: TrieNode
     ) -> bool:
-        """Cláusula 1: el value de "name" debe ser un nombre del trie.
+        """Clause 1: the "name" value must be a valid function name in the trie.
 
-        CÓMO FUNCIONA (por dentro):
-        - El buffer lo acumula LA STATE MACHINE (state.name_buffer), con los
-          escapes skippeados (nombre "decodificado").
-        - DOS ramas, elegidas por dónde termina el token:
-            * Termina DENTRO del value de "name" (post ∈ _NAME_READ_PHASES,
-              key "name", depth 0): el buffer acumulado — incluido lo que
-              este token agregó — debe ser un PREFIJO de algún nombre
-              (find_node ≠ None). Es la rama "el name sigue construyéndose".
-            * SALIÓ del value en este token (pre ∈ _NAME_READ_PHASES, key
-              "name", depth 0, y post no): este token cerró el string (o
-              avanzó a estructura, p.ej. 'greet", "parameters": {'). El
-              buffer FINAL debe ser un nombre COMPLETO (is_complete_name).
-        - El caso '{"name": {' (value que arranca con '{'): pre=COLON cae en
-          la rama 2 con buffer "" → is_complete_name("") = False → bloqueado.
-          Un number/literal como value de "name" se bloquea igual: el buffer
-          queda "" y "" no es un nombre completo.
-        - ¿Por qué estas dos ramas y no más? Un token que EMPIEZA fuera del
-          name y lo atraviesa COMPLETO (key + value + cierre, p.ej.
-          '}, "name": "fn_greet",') no gatilla ninguna: el contenido del
-          name en ese token no se valida contra el trie (quedaría validado el
-          de tokens posteriores... que ya no existen). Raro en vocabularios
-          BPE reales; limitación documentada.
-        - BUG-011 (2026-09-23/24): un ESCAPE ('\\n', '\\t', ...) dentro del
-          value de "name" NO queda bloqueado por el trie "por construcción"
-          — los escapes se skippean del buffer en state.py, así que
-          name_buffer sigue siendo un prefijo válido. El fix REAL vive en
-          `state.py._step_string` (rechaza el '\\' al leerlo, si
-          current_key=="name" and depth==0): acá no alcanza, porque un
-          token BPE que sea el escape COMPLETO ('\\n' fusionado en 1-2
-          tokens) resuelve ESCAPE_IN_STRING → IN_STRING_VALUE DENTRO de
-          `state.simulate()` — el `new_state` final que llega a esta
-          cláusula nunca queda en ESCAPE_IN_STRING, así que un guard aquí
-          es ciego a ese caso (reproducido con 'Greet shrek': el filtro
-          devolvía ese token como único candidato, el pase fino lo
-          rechazaba, y sin más candidatos para probar la generación se
-          cortaba sin completar). Ver state.py para el guard vigente.
+        Uses the FSM name_buffer (decoded, escapes skipped). Two branches:
+        - Post-state still inside the "name" string (depth 0, key "name"): the
+          accumulated buffer (including this token) must be a prefix of some name.
+        - The token closed or left the "name" string (transitioned out): the
+          final buffer must be a complete name.
+
+        Args:
+            new_state: Simulated state after the candidate token.
+            trie: Trie of allowed function names.
+
+        Returns:
+            True if the "name" value is allowed by the trie.
         """
         if (
             new_state.phase in _NAME_READ_PHASES
@@ -409,49 +291,27 @@ class SchemaContext:
         return True
 
     def _allows_param_key(self, new_state: DecoderState) -> bool:
-        """Cláusula 2: las keys de parameters (depth 1) valen contra el schema.
+        """Clause 2: parameter keys (depth 1) must exist and not be duplicated.
 
-        CÓMO FUNCIONA (por dentro):
-        - Trigger por CAMBIO, no por fase: gatilla si el texto de la key
-          (new_state.current_key) cambió durante este token — incluye el
-          reset a "" cuando el token abre una key nueva. Esto cubre el caso
-          que las fases no ven: un token como ', "b": 3.0' arranca DENTRO
-          del value anterior, cierra, y lee la key "b" a mitad de token
-          (termina en IN_NUMBER_VALUE, fuera de cualquier fase de key).
-        - "Abierta" (post en KEY_START/IN_KEY): la key se está construyendo,
-          cualquier prefijo de una key disponible es válido
-          (any(k.startswith(key))). "Cerrada" (el resto): membership exacta.
-        - available se calcula contra keys_enclosed COMMITEADO (self._keys_
-          enclosed), NO contra el del estado simulado. Motivo: si el token
-          cierra el value de la key nueva en el MISMO paso (', "b": 2,'), el
-          set simulado ya la contiene y la membership la bloquearía siendo
-          perfectamente legítima. Contra el commiteado, "b" sigue siendo
-          válida; y un DUPLICADO exacto ('"b": 3' con "b" ya emitida) queda
-          bloqueado porque su key ya estaba en el set commiteado.
-        - Sin función seleccionada → available vacío → TODA key de params se
-          bloquea. Refuerzo deliberado (más fuerte que el plan): fuerza
-          name-antes-de-parameters en la práctica, porque el '}' de cierre
-          también se bloquea sin función (cláusula 4) y el generador no puede
-          salir del objeto parameters sin haber nombrado la función.
-        - Limitación residual 1 (duplicado): una key re-emitida con texto
-          IDÉNTICO al commiteado (la máquina la resetea a "" y la reconstruye
-          igual) no se detecta como cambio. Duplicados exactos en el MISMO
-          texto de key que ya estuviera commiteado sí se bloquean; el caso
-          "reset y reconstrucción idéntica en un solo token" escapa (raro en
-          BPE).
-        - Limitación residual 2 (DESCUBIERTA): el trigger exige self._depth
-          == 1 COMMITEADO; un token que ENTRA a parameters y abre la PRIMERA
-          key en el MISMO paso ('", "parameters": {"a') arranca en depth 0 →
-          `self._depth != 1` abstiene y la key jamás se valida, ni en este
-          token ni en los siguientes (el trigger por cambio no vuelve a
-          disparar: current_key sigue siendo "a"). La key entra de contrabando
-          y el schema la acepta de por vida. Raro en BPE real (token de ~20
-          chars); el pase fino post-argmax (viable en Task 4.1) lo cierra.
+        Triggered when current_key changes in this token (covers cases where
+        a key is read mid-token across a value boundary). For a key that is
+        still being built, any available key that starts with it is allowed;
+        once closed, exact membership is required.
+
+        The set of available keys is computed against the committed
+        keys_enclosed (self._keys_enclosed), not the simulated one, so that
+        a key closed within the same token is not treated as a duplicate.
+
+        Args:
+            new_state: Simulated state after the candidate token.
+
+        Returns:
+            True if the parameter key transition is allowed.
         """
         if self._depth != 1:
-            return True  # output keys (depth 0): fuera del scope del schema
+            return True
         if new_state.current_key == self._current_key:
-            return True  # este token no tocó el texto de la key
+            return True
         if self.selected_function is None:
             return False
         available = set(self.selected_function.parameters) - self._keys_enclosed
@@ -463,29 +323,24 @@ class SchemaContext:
     def _allows_value_type(
         self, token_text: str, new_state: DecoderState
     ) -> bool:
-        """Cláusula 3: el value de un parámetro debe declarar su tipo.
+        """Clause 3: a parameter value must match the declared type.
 
-        CÓMO FUNCIONA (por dentro):
-        - El tipo se lee de DOS lugares, según cómo termina el token:
-            * Termina DENTRO de una fase de value (post ∈ _VALUE_PHASES): la
-              fase declara el tipo (_PHASE_KIND). Como la fase de un value en
-              curso NO cambia token a token, re-chequear continuaciones es
-              idempotente: mismo phase → mismo veredicto.
-            * Arrancó en COLON y el value se abrió y cerró EN ESTE token
-              ('2,' / 'true}' / '"x",'): el post-state ya no está en fase de
-              value; el tipo se lee del PRIMER carácter del texto
-              (_VALUE_START_KINDS, con lstrip por el ws inicial).
-        - Solo aplica a depth 1 con función seleccionada: el value de un
-          parámetro conocido. El value de "name" (depth 0) NO pasa por acá:
-          lo restringe el trie (cláusula 1). Keys sin tipo conocido en el
-          schema → default allow. '{' (objeto anidado) no está en
-          _VALUE_START_KINDS → sin constraint (gap de depth >= 2).
-        - Limitación residual (documentada): un token que abra, complete y
-          cierre un value NUEVO arrancando desde DENTRO del value anterior
-          (', "b": "x",' — key nueva + value string + cierre, todo en uno)
-          ni termina en fase de value ni arranca en COLON: esquiva la
-          cláusula. Raro en vocabularios BPE reales; parsear key:value
-          múltiples por token es trabajo de un parser paramétrico (B8).
+        The kind is inferred in two ways:
+        - If the post-state is in a value phase, the phase declares the kind.
+        - If the committed phase was COLON and the value opens and closes
+          within the same token, the first character of the token text
+          determines the kind.
+
+        This applies only when reading a parameter value (depth 1) for the
+        selected function. Unknown keys default to allow; non-scalar values
+        (e.g. objects) produce no kind and are allowed.
+
+        Args:
+            token_text: Text of the candidate token.
+            new_state: Simulated state after the candidate token.
+
+        Returns:
+            True if the value type is allowed.
         """
         kind: str | None = None
         if new_state.phase in _VALUE_PHASES:
@@ -493,17 +348,12 @@ class SchemaContext:
         elif self._phase is DecoderPhase.COLON:
             kind = _VALUE_START_KINDS.get(token_text.lstrip()[:1])
         if kind is None:
-            return True  # el token no abrió un value (o es de tipo no escalar)
+            return True
         if new_state.depth != 1 or self.selected_function is None:
-            return True  # solo se tipa el value de un parámetro (depth 1)
+            return True
         param = self.selected_function.parameters.get(new_state.current_key)
         if param is None:
-            return True  # key sin tipo conocido: default allow
-        # Compatibilidad y NO igualdad: "integer" es un tipo de la moulinette,
-        # no de JSON, así que un token numérico lo satisface igual que a
-        # "number". Con `kind == param.type` un parámetro declarado "integer"
-        # (que sólo existe en el set privado) rechazaría todos los tokens
-        # candidatos y el decoder quedaría sin nada que generar.
+            return True
         return _declared_type_accepts(kind, param.type)
 
     def _allows_integer_form(self, token_text: str) -> bool:
@@ -537,20 +387,18 @@ class SchemaContext:
         return True
 
     def _allows_params_close(self, new_state: DecoderState) -> bool:
-        """Cláusula 4: el '}' de cierre de parameters exige los required.
+        """Clause 4: closing '}' of parameters requires all required keys present.
 
-        CÓMO FUNCIONA (por dentro):
-        - Trigger por depths: self._depth == 1 (commiteado, DENTRO de
-          parameters) y new_state.depth == 0 → este token cerró el objeto
-          parameters (la máquina solo baja de depth 1 con '}'). El '}' de
-          cierre del output object (depth 0 → COMPLETE) NO gatilla: gap del
-          plan (ver docstring de allows_token).
-        - keys_enclosed del ESTADO SIMULADO (new_state): si el cierre viene
-          junto al value final ('"b": 3}'), ese value ya se registró en la
-          copia simulada y cuenta para el ⊆.
-        - Sin función seleccionada → False: no se puede afirmar que puede
-          cerrar sin conocer los required (conservador, alineado con
-          can_close_params).
+        Triggered when the committed depth is 1 and the simulated depth becomes 0
+        (the token closed the parameters object). The simulated keys_enclosed
+        is used so that a key/value pair completed within the same token
+        counts toward the requirement.
+
+        Args:
+            new_state: Simulated state after the candidate token.
+
+        Returns:
+            True if closing parameters is allowed.
         """
         if self._depth != 1 or new_state.depth != 0:
             return True

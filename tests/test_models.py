@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -10,7 +11,7 @@ from pydantic import ValidationError
 from src.models.function_definition import FunctionDef, ParameterDef
 from src.models.output import FunctionCall
 
-VALID_FUNCTION = {
+VALID_FUNCTION: dict[str, Any] = {
     "name": "fn_add_numbers",
     "description": "Add two numbers together and return their sum.",
     "parameters": {"a": {"type": "number"}, "b": {"type": "number"}},
@@ -27,7 +28,7 @@ class TestFunctionDef:
 
     def test_missing_fields_raise(self) -> None:
         with pytest.raises(ValidationError):
-            FunctionDef(name="fn_missing_stuff")
+            FunctionDef(name="fn_missing_stuff")  # type: ignore[call-arg]
 
     def test_empty_parameters_allowed(self) -> None:
         fn = FunctionDef(name="fn", description="d", parameters={}, returns={})
@@ -39,27 +40,27 @@ class TestFunctionDef:
         assert fn.parameters["b"].name == "b"
 
     def test_invalid_parameter_type_raises(self) -> None:
-        # "object" es un tipo REAL de JSON, pero está fuera del scope del MVP a
-        # propósito (requiere schema recursivo — ver bonus B8). Sigue siendo el
-        # mejor ejemplo de tipo inválido porque el rechazo es INTENCIONAL y no
-        # un olvido.
+        # "object" is a REAL JSON type, but it is deliberately out of the MVP's
+        # scope (it needs a recursive schema — see the "complex nested function
+        # arguments" bonus). It stays the best example of an invalid type because
+        # the rejection is INTENTIONAL, not an oversight.
         #
-        # OJO: este test usaba "integer" como ejemplo y POR ESO codificaba un
-        # bug como comportamiento esperado. "integer" no es un tipo de JSON:
-        # es la manera que tiene la moulinette de marcar un int de Python, y
-        # aparece en las definiciones privadas. Con "integer" fuera del Literal,
-        # load_functions explotaba sobre el set privado y el programa no
-        # arrancaba. Ver test_integer_type_accepted.
+        # NOTE: this test used "integer" as its example and THEREFORE encoded a
+        # bug as expected behavior. "integer" is not a JSON type: it is the
+        # grader's spelling for a Python int, and it appears in the private
+        # definitions. With "integer" out of the Literal, load_functions blew up
+        # on the private set and the program would not start. See
+        # test_integer_type_accepted.
         payload = {**VALID_FUNCTION, "parameters": {"a": {"type": "object"}}}
         with pytest.raises(ValidationError):
             FunctionDef(**payload)
 
     def test_integer_type_accepted(self) -> None:
-        """Regresión del P0: "integer" es un tipo válido (sólo en el set privado).
+        """Regression: "integer" is a valid type (private set only).
 
-        Si este test falla, el programa no arranca con las definiciones privadas
-        (`fn_is_even.n` y `fn_calculate_compound_interest.years` son
-        "integer") y la mitad de la evaluación queda en cero.
+        If this test fails, the program does not start with the private
+        definitions (`fn_is_even.n` and `fn_calculate_compound_interest.years`
+        are "integer") and half of the evaluation scores zero.
         """
         payload = {**VALID_FUNCTION, "parameters": {"a": {"type": "integer"}}}
         fn = FunctionDef(**payload)
@@ -85,7 +86,7 @@ class TestParameterDef:
 
     def test_missing_type_raises(self) -> None:
         with pytest.raises(ValidationError):
-            ParameterDef(name="a")
+            ParameterDef(name="a")  # type: ignore[call-arg]
 
 
 class TestFunctionCall:
@@ -105,29 +106,28 @@ class TestFunctionCall:
 
     def test_missing_name_raises(self) -> None:
         with pytest.raises(ValidationError):
-            FunctionCall(prompt="Greet shrek", parameters={"a": 1})
+            FunctionCall(prompt="Greet shrek", parameters={"a": 1})  # type: ignore[call-arg]
 
     def test_missing_prompt_raises(self) -> None:
-        """El subject V.4 exige las 3 keys: prompt, name y parameters.
+        """The subject requires the 3 keys: prompt, name and parameters.
 
-        `prompt` es obligatorio: la moulinette compara
-        `student_answer["prompt"]` con `correction["prompt"]` por igualdad
-        exacta, así que un FunctionCall sin prompt no es serializable a una
-        entry válida del output.
+        `prompt` is mandatory: the grader compares `student_answer["prompt"]`
+        with `correction["prompt"]` for exact equality, so a FunctionCall
+        without a prompt is not serializable to a valid entry of the output.
         """
         with pytest.raises(ValidationError):
-            FunctionCall(name="fn_greet", parameters={"a": 1})
+            FunctionCall(name="fn_greet", parameters={"a": 1})  # type: ignore[call-arg]
 
 
 class TestEchoView:
-    """`echo_view` es lo que el pipeline imprime en stdout.
+    """`echo_view` is what the pipeline prints to stdout.
 
-    No es un detalle cosmético: el eco se imprimía ANTES de la validación, así
-    que la consola mostraba `replacement: "****"` mientras el JSON en disco ya
-    traía `*`. El corretero scorea el archivo, así que el score era 11/11 igual,
-    pero cualquier revisor que lea la consola ve output roto y cree que el
-    pipeline está mal. Estos tests blindan que la vista proyectada salga del
-    modelo validado y no del dict crudo del decoder.
+    It is not a cosmetic detail: the echo used to be printed BEFORE validation,
+    so the console showed `replacement: "****"` while the JSON on disk already
+    carried `*`. The grader scores the file, so the score was 11/11 all the
+    same, but any reviewer reading the console sees broken output and thinks the
+    pipeline is wrong. These tests lock in that the projected view comes from
+    the validated model and not from the decoder's raw dict.
     """
 
     def test_only_name_and_parameters(self) -> None:
@@ -135,10 +135,11 @@ class TestEchoView:
         assert call.echo_view() == {"name": "fn_greet", "parameters": {"name": "shrek"}}
 
     def test_prompt_is_never_echoed(self) -> None:
-        """El `prompt` no va: la consola ya lo muestra al leer la entrada.
+        """`prompt` is not included: the console already shows it when reading
+        the input.
 
-        Si aparece acá, cada bloque del eco pasa de 3 a 6 líneas y se duplica
-        texto que ya está en pantalla.
+        If it appeared here, every echo block would go from 3 to 6 lines and
+        duplicate text already on screen.
         """
         assert "prompt" not in FunctionCall(prompt="Greet shrek", name="fn_greet").echo_view()
 
@@ -147,11 +148,11 @@ class TestEchoView:
         assert list(view) == ["name", "parameters"]
 
     def test_echo_reflects_post_validation_value(self) -> None:
-        """El caso real de P9: el valor reparado es el que se ve.
+        """The real case: the repaired value is the one shown.
 
-        Este es el test de regresión del bug de stdout. `replacement` vale `*`
-        (ya validado) y el eco tiene que mostrar `*` — no el `****` crudo del
-        decoder. Si alguien vuelve a imprimir el dict crudo, este test falla.
+        This is the regression test for the stdout bug. `replacement` is `*`
+        (already validated) and the echo must show `*` — not the raw `****` from
+        the decoder. If someone prints the raw dict again, this test fails.
         """
         validated = FunctionCall(
             prompt="Replace all vowels in 'Programming is fun' with asterisks",
@@ -165,8 +166,9 @@ class TestEchoView:
         assert validated.echo_view()["parameters"]["replacement"] == "*"  # type: ignore[index]
 
     def test_echo_is_json_serializable(self) -> None:
-        """El pipeline lo pasa por `json.dumps(..., indent=2)`: tiene que
-        serializar sin inventar nada, y sin `ensure_ascii` para los acentos."""
+        """The pipeline runs it through `json.dumps(..., indent=2)`: it must
+        serialize without inventing anything, and without `ensure_ascii` for the
+        accents."""
         call = FunctionCall(prompt="Saludá a shrek", name="fn_greet", parameters={"name": "Ñandú"})
         dumped = json.dumps(call.echo_view(), indent=2, ensure_ascii=False)
         assert "Ñandú" in dumped

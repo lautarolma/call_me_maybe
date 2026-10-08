@@ -146,31 +146,31 @@ def track_prompt(index: int) -> Iterator[None]:
 def report_prompt_metrics(
     runs: Sequence[MetricsRun], out_path: Path | None = None
 ) -> None:
-    """Imprime y persiste el conteo de forwards POR PROMPT.
+    """Print and persist the forward count PER PROMPT.
 
-    POR QUÉ UN `MetricsRun` POR PROMPT y no uno acumulado: el conteo de
-    forwards es la ÚNICA magnitud de la decodificación que NO depende del
-    hardware. No hay KV-cache, así que un forward es "re-alimentar la
-    secuencia completa", y *cuántas* veces hay que hacerlo lo decide la
-    gramática (estado + oráculo + filtro), no la CPU. Por eso comparar ese
-    número entre dos corridas es lo que separa las dos hipótesis que
-    comparten síntoma:
+    WHY ONE `MetricsRun` PER PROMPT instead of a single accumulator: the
+    forward count is the ONLY decoding magnitude that does NOT depend on the
+    hardware. There is no KV-cache, so a forward means "re-feed the whole
+    sequence", and *how many* times that must happen is decided by the
+    grammar (state + oracle + filter), not by the CPU. Comparing that number
+    between two runs is what separates the two hypotheses that share the same
+    symptom:
 
-        forwards IGUALES  →  el código hizo el mismo trabajo y el tiempo
-                            extra es AMBIENTE (compilación, thermal, stole).
-        forwards DISTINTOS → el código cambió el trabajo; hay que optimizar.
+        forwards EQUAL    -> the code did the same work and the extra time
+                             is ENVIRONMENT (compilation, thermal, noise).
+        forwards DIFFERENT -> the code changed the work; optimize.
 
-    La columna `s/fwd` es la contraparte: si sube con el mismo conteo de
-    forwards, la máquina estuvo más lenta por cada operación.
+    The `s/fwd` column is the counterpart: if it rises while the forward
+    count stays the same, the machine was slower per operation.
 
-    ⚠️ POR QUÉ NO REUSA `MetricsRun.report()`: ese método fija
-    `warm_up_discarded: True`, que describe el protocolo de benchmark (se
-    descarta una pasada de warm-up). El pipeline NO descarta ninguna, así que
-    escribir ese `true` en el JSON sería un dato falso en la evidencia.
+    WHY IT DOES NOT REUSE `MetricsRun.report()`: that method hardcodes
+    `warm_up_discarded: True`, which describes the benchmark protocol (one
+    warm-up pass is discarded). The pipeline discards none, so writing that
+    `true` into the JSON would be false data in the evidence.
 
     Args:
-        runs: Un `MetricsRun` por prompt, en el orden en que se corrieron.
-        out_path: Si se pasa, escribe el mismo desglose como JSON.
+        runs: One `MetricsRun` per prompt, in the order they ran.
+        out_path: If given, writes the same breakdown as JSON.
     """
     print()
     print("=== Per-prompt decode metrics ===")
@@ -181,8 +181,8 @@ def report_prompt_metrics(
         totals = prompt_run.totals()
         forwards = int(totals["total_forwards"])
         elapsed_s = float(totals["elapsed_time_ms"]) / 1000.0
-        # Sin forwards el cociente no existe (todo oráculo/M5): se muestra
-        # como n/a en vez de dividir por cero y reventar la corrida.
+        # With no forwards the quotient does not exist (all oracle/M5): show
+        # n/a instead of dividing by zero and killing the run.
         s_per_fwd = f"{elapsed_s / forwards:>6.2f}" if forwards else f"{'n/a':>6}"
         print(
             f"  {index:>3}  {forwards:>8}  {int(totals['skips_if_single']):>6}"

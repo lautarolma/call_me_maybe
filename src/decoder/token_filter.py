@@ -1,36 +1,12 @@
-"""Token filter del constrained JSON decoder (Task 3.4).
+"""Token filter for the constrained JSON decoder.
 
-POR QUÉ EXISTE ESTE MÓDULO (por dentro):
-- La generación sale de TODOS los ids del vocabulario (~151K en Qwen). Por
-  cada step, compute_allowed_ids() reduce ese espacio a los tokens que
-  mantienen el output como JSON válido (sintaxis + semántica). Es la capa
-  MÁS caliente del pipeline: el generator (Task 4.1) la llama una vez por
-  token generado y hace argmax sobre el resultado (por eso logits viaja en
-  la firma, aunque acá NO se consume: el masking lógico YA ocurrió cuando
-  un id queda fuera del set).
-- La validación está repartida por diseño:
-    Fase 1 (pre-filtro)  → state.expected_first_chars() + pre-índice
-                           Vocab.tokens_starting_with. O(1) sobre el vocab.
-    Fase 2 (sintaxis)    → DecoderState.simulate(): la state machine.
-    Fase 3 (semántica)   → SchemaContext.allows_token(): trie + schema.
-
-TRES DESVÍOS DOCUMENTADOS del pseudocódigo del plan (PLAN_DIDACTICO L1615):
-1. Fase 2 usa vocab.id2decoded, NO vocab.id2token. La state machine trabaja
-   con el texto DECODIFICADO ('Ġthe' → ' the'): es lo que el validador
-   realmente compara. Vocab mantiene las dos vistas a propósito (ver
-   vocab_loader.py); id2token aporta tokens byte-mapheados que romperían
-   la validación char por char.
-2. El wildcard '*' de expected_first_chars se interpreta acá como "saltarse
-   el pre-filtro": se toman TODOS los buckets del pre-índice menos el de
-   tokens no decodificables (BYTE_CATEGORY = '<byte>'). Las keys y strings
-   libres pueden empezar con cualquier carácter real.
-3. _is_clean_utf8() se aplica al texto DECODIFICADO (no al crudo del plan):
-   los bytes UTF-8 incompletos de un token aparecen como U+FFFD o
-   surrogates JUSTO en la decodificación (model.decode no siempre lanza).
-
-QUÉ NO HACE (separación de concerns):
-- No conoce el schema ni los nombres de funciones: Fase 1 y 2 son pura
-  sintaxis; Fase 3 delega en SchemaContext. El argmax vive en Task 4.1.
+Reduces the vocabulary (~151K tokens) to those that keep the output
+syntactically and semantically valid at each step. Called once per
+generated token; when logits are provided, only a top-k subset is
+evaluated (M1/M2). The filter is split into three phases:
+1. Pre-filter by first character (bucket index).
+2. Syntax via DecoderState.simulate() on decoded text.
+3. Semantics via SchemaContext.allows_token().
 """
 
 from __future__ import annotations
@@ -40,27 +16,22 @@ from src.decoder.state import DecoderPhase, DecoderState
 from src.decoder.trie import TrieNode
 from src.loader.vocab_loader import BYTE_CATEGORY, Vocab
 
-# Tiers para el escalonamiento del Top-K masking (M2).
-# En vez de validar K=2000 candidatos de golpe, se valida por tandas
-# crecientes. Si el top-1 pasa → retorno inmediato (O(1)).
-# Si no, se prueban los siguientes 5, luego 10, 20, etc.
-# El beneficio: en el caso promedio, el token válido está en los
-# primeros 50-100 candidatos → se validan ~50 en vez de 2000.
+# Tiers for top-k masking with M2. Validate candidates in increasing
+# batches instead of all at once. M1 returns immediately on success.
 TIER_SIZES: list[int] = [1, 5, 10, 20, 50, 100, 200, 500, 1000, 2000]
 
 
 def _is_clean_utf8(text: str) -> bool:
-    """True si el texto decodificado no tiene marcadores de bytes inválidos.
+    """Return True if decoded text contains no invalid UTF-8 markers.
 
-    CÓMO FUNCIONA (por dentro):
-    - U+FFFD (replacement character): lo que produce el decode de una
-      secuencia de bytes UTF-8 inválida. La state machine lo aceptaría como
-      un char más de un string, pero NO es texto real del usuario: el token
-      está contaminado y hay que descartarlo.
-    - Surrogates (U+D800..U+DFFF): no son scalar values; str.encode('utf-8')
-      los rechaza. Si entraran al output, romperían el encode final.
-    - La comparación "\ud800" <= ch <= "\udfff" es correcta para chars
-      individuales: Python compara strings por code point.
+    Rejects U+FFFD (replacement character) and surrogate code points
+    (U+D800–U+DFFF), which would be invalid for UTF-8 re-encoding.
+
+    Args:
+        text: Decoded token text.
+
+    Returns:
+        True if the text is clean UTF-8.
     """
     return "\ufffd" not in text and not any(
         "\ud800" <= ch <= "\udfff" for ch in text
@@ -75,73 +46,43 @@ def compute_allowed_ids(
     logits: list[float] | None = None,
     top_k: int = 2000,
 ) -> set[int]:
-    """Computa el set de ids permitidos para el próximo step de generación.
+    """Compute allowed token IDs for the next generation step.
+
+    Two return contracts exist:
+    1. With logits (hot path): validate only the model's top-k candidates
+       and return those among them that are valid. This is a subset of all
+       valid tokens (not the full set). Advantage: ~K validations instead
+       of ~151K.
+    2. Without logits (skip-if-single): validate the entire vocabulary and
+       return the complete set of valid tokens (used when the size must be
+       exactly 1).
+
+    M1 (top-1 opportunistic): if the argmax passes simulate + allows_token,
+    return {best_id} immediately (zero extra validations). M2 (top-k with
+    tiering): validate ranked candidates in increasing tiers [1,5,10,...,2000]
+    and return the ENTIRE TIER that first produces any valid token (not just
+    the first valid). Returning the full tier preserves alternatives for the
+    fine pass, so a veto of the single best does not cut generation when
+    other valid tokens exist in that tier.
+
+    Phases:
+    1. Pre-filter by first characters (expected_first_chars). If '*' appears,
+       include all real buckets (exclude BYTE_CATEGORY).
+    2. Syntax: for each candidate, require clean UTF-8 decoded text and
+       state.simulate(decoded) to be valid (one token = one char sequence).
+    3. Semantics: schema.allows_token(decoded, new_state, trie).
 
     Args:
-        state: Estado COMMITEADO del decoder (el del token ganador anterior).
-        schema: SchemaContext ya sincronizado con state (update(state)).
-        vocab: Vocabulario pre-indexado (id2decoded + tokens_starting_with).
-        trie: Trie de nombres de función (build_trie).
-        logits: Preferencias del modelo. Si se provee, se usa Top-1
-            opportunistic (fast-path) y Top-K masking para reducir el
-            universo de candidatos de ~151K a top_k. Si es None (skip-if-
-            single), se ejecuta el filtro completo (necesario para determinar
-            si hay exactamente 1 candidato).
-        top_k: Máximo de candidatos a validar cuando se usan logits.
-            Default 2000 (conservador: Qwen asigna ~99% de masa a ~1000
-            tokens).
+        state: Committed decoder state (after previous token).
+        schema: SchemaContext synchronized with state (update called).
+        vocab: Indexed vocabulary (id2decoded, tokens_starting_with).
+        trie: Trie of allowed function names.
+        logits: Model logits; if provided, use M1 and M2. If None, scan full
+            vocabulary.
+        top_k: Maximum candidates to rank when logits are provided.
 
     Returns:
-        set de ids cuyo texto decodificado mantiene el output válido.
-        OJO: la cantidad de elementos depende de si se pasaron logits, y esa
-        diferencia es deliberada (ver "DOS CONTRATOS DE RETORNO" abajo).
-
-    DOS CONTRATOS DE RETORNO — hay que entenderlo para no leer mal el
-    resultado:
-
-    1. CON logits (camino caliente, el 99% de los steps): se valida solo el
-       top-k del modelo y se devuelven los válidos de ESE top-k (1..top_k
-       elementos). Los tokens fuera del top-k no se miraron: no es "el
-       conjunto de todos los tokens válidos", es "el subconjunto de
-       válidos que el modelo ya quería usar". La ventaja es que en cada step
-       sólo se simulan ~2000 candidatos en vez de ~151K.
-    2. SIN logits (skip-if-single, camino frío): se valida el vocabulario
-       entero y se devuelve el conjunto completo de válidos. Se usa
-       únicamente cuando hace falta saber si el conjunto es de tamaño
-       exactamente 1.
-
-    La consecuencia práctica (y la trampa): el generador sólo necesita un
-    SEGUNDO token cuando el primero falla el pase fino. Por eso el camino
-    caliente se alcanza a proteger con un solo candidato, pero el frío puede
-    devolver decenas y ese segundo candidato es el que salva una generación que
-    el pase fino iba a cortar.
-
-    M1 y M2 no devuelven lo mismo a propósito:
-    - M1 (el token que el modelo quiere, sin maskear) devuelve como máximo 1
-      candidato. Es el fast path: si el argmax sobrevive al pase fino, ya
-      está, y no se validó nada más. Coste: cero validaciones extra.
-    - M2 (el top-k del modelo) devuelve TODOS los válidos de los primeros
-      2000, stopping en el primer tier que produjo alguno. Acumula en vez de
-      cortar en el primer válido, para que el pase fino tenga alternativas
-      reales entre las que elegir.
-
-    OJO con la asimetría que deja esto: si M1 gana (el argmax sobrevive al
-    filtro) pero el pase fino lo rechaza igual, no hay segundo candidato y
-    el veto se aplica. Con M2 no pasa: hay hasta 2000 alternativas. Es una
-    decisión de performance, no un olvido — M1 existe para no validar nada
-    cuando la decisión ya está tomada.
-
-    CÓMO FUNCIONA (por dentro):
-    - Fase 1: junta los buckets del pre-índice para los chars esperados. Si
-      expected_first_chars() trae '*' (key o string abiertos), se toman
-      TODOS los buckets reales (nunca BYTE_CATEGORY): cualquier carácter es
-      legal para empezar/continuar una key o un string.
-    - Fase 2: por cada candidato, el texto DECODIFICADO (desvío 1) debe
-      pasar _is_clean_utf8 (desvío 3) y simulate(): si cualquier carácter
-      rompe la gramática JSON, el token completo es inválido (el ídem del
-      plan: "1 token = 1 secuencia de chars atómica").
-    - Fase 3: SchemaContext.allows_token() valida semántica (trie, keys,
-      tipos, cierres). PURA: no muta ni state ni schema.
+        Set of token IDs whose decoded text keeps the output valid.
     """
     expected_chars = state.expected_first_chars()
 
@@ -174,8 +115,8 @@ def compute_allowed_ids(
     # Si logits se proveyeron, usar Top-1 opportunistic (O(1)) y luego
     # Top-K masking (O(K)) para reducir el universo de candidatos.
     if logits is not None:
-        # M1: Top-1 Opportunistic — si el token con mayor logit pasa
-        # simulate + allows_token, retornar directamente (O(1), <0.1ms).
+        # M1: top-1 opportunistic: if the highest-logit token passes
+        # simulate + allows_token, return immediately.
         best_id = max(range(len(logits)), key=lambda i: logits[i])
         best_decoded = vocab.id2decoded.get(best_id)
         if (
@@ -186,38 +127,16 @@ def compute_allowed_ids(
             if valid and schema.allows_token(best_decoded, new_state, trie):
                 return {best_id}
 
-        # M2: Top-K Masking con escalonamiento por tiers.
-        # En vez de validar K candidatos de golpe, se validan por tandas
-        # crecientes. Se devuelve el PRIMER TIER que produjo algún válido, y
-        # ese tier COMPLETO (no solo el primer válido del tier).
+        # M2: top-k masking with tiering. Return the FIRST tier that
+        # produces any valid token, and return that ENTIRE tier (not just
+        # the first valid). Returning the full tier preserves alternatives
+        # for the fine pass.
         import heapq
-        # Pre-sort: los top_k IDs de mayor logit, en orden descendente.
         ranked_ids = heapq.nlargest(
             top_k, range(len(logits)), key=logits.__getitem__
         )
-        # Intersección con candidate_ids de Fase 1: solo los que
-        # matchean el bucket.
         ranked_ids = [tid for tid in ranked_ids if tid in candidate_ids]
 
-        # Escalonamiento: validar por tiers hasta que uno produzca candidatos.
-        #
-        # ⚠ POR QUÉ EL TIER COMPLETO Y NO EL PRIMER VÁLIDO (fix 2026-09-30):
-        # esta función devolvía {el primer válido} → un singleton SIEMPRE. El
-        # pase fino del generator (`_pick_best_token`) está diseñado para
-        # descartar al mejor y PROBAR EL SIGUIENTE, pero con un solo candidato
-        # no había siguiente: su `while allowed:` itera exactamente una vez y
-        # `generate()` corta la generación (output truncado, ok=False). Eso
-        # era un veto, no un filtro — y el Inciso 4.1.1, que existe para
-        # cubrir los tokens que cruzan dos puntos de validación de una vez
-        # (residuales R1/R2/R3 de schema_validator), no podía cumplir su
-        # función. Devolver el tier completo le da al pase fino los
-        # alternativos que el diseño siempre presupuso.
-        #
-        # NO cambia la Candidatura: el tier se detiene en el primero que produce
-        # algo, así que el caso promedio (el top-1 del tier 1 es válido)
-        # devuelve un singleton igual que antes. Solo se agregan candidatos
-        # cuando el tier tenía MÁS de un válido, que es exactamente cuando
-        # hacen falta.
         checked = 0
         for tier_size in TIER_SIZES:
             end = min(checked + tier_size, len(ranked_ids))

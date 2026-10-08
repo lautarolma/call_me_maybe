@@ -3,7 +3,6 @@
 Public API:
     parse_output            — raw decoder string -> dict
     build_function_call     — (prompt, dict) -> FunctionCall
-    validate_output         — raw string + definitions -> FunctionCall | str
     build_results           — (prompts, generations) -> list[FunctionCall]
     find_unsupported_prompts — prompts with no value backed by their text
 """
@@ -15,7 +14,6 @@ from src.validator.output_validator import (
     build_results,
     find_unsupported_prompts,
     parse_output,
-    validate_output,
 )
 
 __all__ = [
@@ -23,5 +21,4 @@ __all__ = [
     "build_results",
     "find_unsupported_prompts",
     "parse_output",
-    "validate_output",
 ]

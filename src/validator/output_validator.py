@@ -6,10 +6,9 @@ string has to become an entry of the output array the grader reads. The
 intermediate step is not optional: this is where things break if nothing
 is checked.
 
-This module does THREE things, all pure (no model, no I/O):
+This module does TWO things, all pure (no model, no I/O):
   1. `parse_output`       — raw string -> dict (json.loads, with tolerance)
   2. `build_function_call` — (prompt, dict) -> FunctionCall (pydantic validation)
-  3. `validate_output`    — raw string + functions -> FunctionCall | str
 
 Why not a single `json.loads` and done:
   · The decoder guarantees syntactically valid JSON BY CONSTRUCTION, but
@@ -49,7 +48,6 @@ from __future__ import annotations
 import json
 import sys
 
-from src.models.function_definition import FunctionDef
 from src.models.output import FunctionCall
 
 
@@ -330,50 +328,6 @@ def build_function_call(prompt: str, payload: dict[str, object]) -> FunctionCall
         # without parameters).
         parameters=repaired_parameters,
     )
-
-
-def validate_output(
-    raw: str,
-    functions: list[FunctionDef],
-) -> FunctionCall | str:
-    """Validate one generation against the available definitions.
-
-    Args:
-        raw: Decoder text for ONE prompt.
-        functions: Definitions loaded from the input.
-
-    Returns:
-        ``FunctionCall`` if the generation is valid and its `name` exists in
-        ``functions``; or an error string if something fails.
-
-    WHY it returns `FunctionCall | str` instead of raising:
-    The subject requires the program to "must never crash unexpectedly"
-    and problem prompts must not kill the pipeline. Returning the error as
-    a value lets the caller log it and continue with the next prompt.
-
-    NOTE on `name` validation:
-    We check that the name EXISTS in the definitions, but NOT that the
-    parameters match that function's schema. That deeper validation is
-    still pending: what unblocks the deliverable is that the file exists
-    and is parseable, not that it be semantically perfect.
-    """
-    try:
-        payload = parse_output(raw)
-    except json.JSONDecodeError as exc:
-        return f"invalid JSON: {exc}"
-    if not isinstance(payload, dict):
-        return f"expected a JSON object, got {type(payload).__name__}"
-
-    try:
-        call = build_function_call(prompt="", payload=payload)
-    except Exception as exc:  # pydantic.ValidationError y subclases
-        return f"schema violation: {exc}"
-
-    known = {f.name for f in functions}
-    if call.name not in known:
-        return f"unknown function {call.name!r} (known: {sorted(known)})"
-
-    return call
 
 
 def build_results(

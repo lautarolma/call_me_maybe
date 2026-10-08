@@ -25,7 +25,6 @@ from src.validator.output_validator import (
     build_results,
     find_unsupported_prompts,
     parse_output,
-    validate_output,
 )
 
 
@@ -128,7 +127,7 @@ def test_snap_ignores_non_string_values() -> None:
 
 
 def test_snap_is_noop_with_empty_prompt() -> None:
-    """`validate_output` builds with prompt="" → no-op by design."""
+    """An empty prompt has no query text to anchor to: the value is untouched."""
     call = build_function_call("", {"name": "fn_x", "parameters": {"s": "home/user"}})
     assert call.parameters["s"] == "home/user"
 
@@ -278,21 +277,6 @@ def test_chain_leaves_non_string_values_untouched() -> None:
         {"name": "fn_multiply_numbers", "parameters": {"a": 3, "b": 5.0}},
     )
     assert call.parameters == {"a": 3, "b": 5.0}
-
-
-# --------------------------------------------------------------------------
-# validate_output
-# --------------------------------------------------------------------------
-def test_validate_output_reports_invalid_json_as_value() -> None:
-    result = validate_output("{oops", [])
-    assert isinstance(result, str)
-    assert "invalid JSON" in result
-
-
-def test_validate_output_reports_unknown_function() -> None:
-    result = validate_output('{"name": "fn_nope"}', [])
-    assert isinstance(result, str)
-    assert "unknown function" in result
 
 
 # --------------------------------------------------------------------------

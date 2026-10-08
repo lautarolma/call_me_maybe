@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field, field_validator
 #: "complex nested function arguments" bonus turns them on — leave it off
 #: until the MVP is green).
 #:
-#: Why "integer" is here, although JSON has no such type: the moulinette's
+#: Why "integer" is here, although JSON has no such type: the grader's
 #: extractor spells a Python int as "integer" (float -> "number") and the
 #: private function set uses it. Without this member ``load_functions``
 #: fails Literal validation and the program cannot start on the private
@@ -36,7 +36,7 @@ class ParameterDef(BaseModel):
     type: ParameterType = Field(
         description=(
             "Parameter type: 'string', 'number', 'integer', 'boolean', 'null'. "
-            "'integer' is not a JSON type: it is the moulinette's spelling for "
+            "'integer' is not a JSON type: it is the grader's spelling for "
             "'this parameter is a Python int' (see ParameterType)"
         )
     )

@@ -1,45 +1,45 @@
 """Output validation: turn the decoder's raw string into a checked FunctionCall.
 
-QUÉ HACE ESTE MÓDULO (y por qué existe):
-El decoder restringido produce un STRING de texto con el JSON del function
-call. Ese string tiene que convertirse en una entrada del array de salida
-que la moulinette lee. El paso intermedio no es opcional: es donde fallan
-las cosas si no se chequea nada.
+WHAT THIS MODULE DOES (and why it exists):
+The constrained decoder produces a STRING with the function-call JSON. That
+string has to become an entry of the output array the grader reads. The
+intermediate step is not optional: this is where things break if nothing
+is checked.
 
-Este módulo hace TRES cosas, todas puras (sin modelo, sin I/O):
-  1. `parse_output`      — string crudo  -> dict (json.loads, con tolerancia)
-  2. `build_function_call` — (prompt, dict) -> FunctionCall (validación pydantic)
-  3. `validate_output`   — string crudo + functions -> FunctionCall | str
+This module does THREE things, all pure (no model, no I/O):
+  1. `parse_output`       — raw string -> dict (json.loads, with tolerance)
+  2. `build_function_call` — (prompt, dict) -> FunctionCall (pydantic validation)
+  3. `validate_output`    — raw string + functions -> FunctionCall | str
 
-Por qué NO un solo `json.loads` y ya:
-  · El decoder garantiza JSON sintácticamente válido POR CONSTRUCCIÓN, pero
-    no garantiza que el contenido encaje con el schema de la función
-    elegida. `name` podría no existir en functions_definition.json.
-  · Si no validamos acá, el error aparece en la moulinette del evaluador
-    como un cero, no como un mensaje que podamos entender.
+Why not a single `json.loads` and done:
+  · The decoder guarantees syntactically valid JSON BY CONSTRUCTION, but
+    not that the content matches the schema of the chosen function. `name`
+    might not exist in functions_definition.json.
+  · Without validation here, the error surfaces in the evaluator's grader
+    as a zero, not as a message anyone can understand.
 
-LAS TRES REPARACIONES POST-HOC (`_repair_string_value`):
-  El modelo restringido copia bien la frase del usuario pero la deforma al
-  copiarla. Hay tres deformaciones medidas, y cada una tiene su reparación:
-    A · `_snap_to_query_span`     — copia TRUNCADA  (clip de puntuación líder)
-    B · `_restore_internal_quotes` — copia SIN comillas internas
-    C · `_collapse_repeated_run`   — copia CONTADA (una repetición por match)
-  Las tres son post-hoc (no tocan logits), derivadas de la query, y comparten una
-  sola norma: *el valor tiene que estar respaldado por la frase del usuario; si
-  no, es una invención y se normaliza*. Cuando no hay una corrección única
-  respaldada por evidencia, devuelven el valor SIN tocar.
+THE THREE POST-HOC REPAIRS (`_repair_string_value`):
+  The constrained model copies the user's phrase well but deforms it while
+  copying. There are three measured deformations, each with its repair:
+    A · `_snap_to_query_span`      — TRUNCATED copy (leading punctuation clipped)
+    B · `_restore_internal_quotes` — copy MISSING internal quotes
+    C · `_collapse_repeated_run`   — COUNTED copy (one repetition per match)
+  All three are post-hoc (they do not touch logits), derived from the query,
+  and share a single norm: *the value must be backed by the user's phrase;
+  otherwise it is an invention and gets normalized*. When there is no unique
+  evidence-backed correction, they return the value untouched.
 
-LA REGLA DE ORO — no romper el alineamiento posicional:
-La moulinette empareja answers y correcciones con `zip()`, que es
-POSICIONAL. Si una entry falta en medio, TODAS las de después se desalinean
-y el score se arruina. Por eso `build_results` NUNCA omite una entry: si un
-prompt falla, emite un placeholder en esa posición exacta y sigue. Perder
-un test es perdible; perder once es fatal.
+THE GOLDEN RULE — never break positional alignment:
+The grader pairs answers and corrections with `zip()`, which is
+POSITIONAL. If an entry is missing in the middle, ALL entries after it
+misalign and the score is ruined. That is why `build_results` NEVER skips
+an entry: if a prompt fails, it emits a placeholder at that exact position
+and continues. Losing one test is acceptable; losing eleven is fatal.
 
-CÓMO SE USA (ver pipeline.py):
-    raw_prompts = load_prompts(args.input)          # texto CRUDO del input
+HOW IT IS USED (see pipeline.py):
+    raw_prompts = load_prompts(args.input)          # RAW input text
     for i, raw_prompt in enumerate(raw_prompts):
-        generated = generate(...)[0]                # string del decoder
+        generated = generate(...)[0]                # decoder string
         result = build_results(raw_prompts, generated_list)
     write_results(result, args.output)
 """
@@ -53,75 +53,78 @@ from src.models.function_definition import FunctionDef
 from src.models.output import FunctionCall
 
 
-# Valor usado para el campo `name` cuando la generación no se pudo parsear.
-# NO es un nombre de función real: es un marcador que hará que ese único
-# test falle con "unknown function" en la moulinette, sin arrastrar a los
-# demás. Cualquier valor no-existente sería igual de malo, pero este es
-# legible en el log de errores.
+# Value used for the `name` field when the generation could not be parsed.
+# NOT a real function name: it is a marker that makes that ONE test fail
+# with "unknown function" in the grader without dragging down the rest.
+# Any non-existent value would be equally valid, but this one is readable
+# in the error log.
 _UNKNOWN_FN_SENTINEL = "__unparseable__"
 
-#: Delimitadores que marcan el borde IZQUIERDO de un valor copiado de la query.
-#: Whitespace y comillas separan palabras/valores en lenguaje natural. Un
-#: alfanumérico pegado a la izquierda significa que el valor es el SUFIJO de
-#: una palabra más larga ("llo" dentro de "hello") y NO se debe estirar.
+#: Delimiters that mark the LEFT edge of a value copied from the query.
+#: Whitespace and quotes separate words/values in natural language. An
+#: alphanumeric glued to the left means the value is the SUFFIX of a longer
+#: word ("llo" inside "hello") and must NOT be stretched.
 _SNAP_BOUNDARY = frozenset(" \t\n\r\"'")
 
 
 def parse_output(raw: str) -> dict[str, object]:
-    """Parsea el string del decoder a un dict.
+    """Parse the decoder string into a dict.
 
     Args:
-        raw: Texto producido por el decoder (JSON con whitespace opcional
-            alrededor — el decoder emite '\\n\\n{\\n  "name": ...').
+        raw: Text produced by the decoder (JSON with optional surrounding
+            whitespace — the decoder emits '\\n\\n{\\n  "name": ...').
 
     Returns:
-        El dict parseado.
+        The parsed dict.
 
     Raises:
-        json.JSONDecodeError: si el texto no es JSON válido.
+        json.JSONDecodeError: if the text is not valid JSON.
 
-    POR QUÉ strip():
-    El decoder puede dejar newlines/espacios alrededor del objeto
-    (`'\\n\\n{\\n  ...\\n}'`). `json.loads` los tolera igual (los whitespace
-    son válidos fuera de un valor), pero el `strip()` documenta la
-    intención y protege contra BOMs, que `json.loads` NO tolera.
+    WHY strip():
+    The decoder can leave newlines/spaces around the object
+    (`'\\n\\n{\\n  ...\\n}'`). `json.loads` tolerates them anyway (whitespace
+    is valid outside a value), but the `strip()` documents the intent and
+    guards against BOMs, which `json.loads` does NOT tolerate.
     """
     return json.loads(raw.strip())  # type: ignore[no-any-return]
 
 
 def _snap_to_query_span(value: str, prompt: str) -> str:
-    """Re-ancla un valor string al tramo VERBATIM de la query del que salió.
+    """Re-anchor a string value to the VERBATIM span of the query it came from.
 
-    QUÉ PROBLEMA RESUELVE (caso real medido, test privado 8):
-    el prompt dice ``Read the file at /home/user/data.json with utf-8`` y el
-    modelo emite ``path = "home/user/data.json"``: copia bien TODO el path
-    menos la puntuación líder (``/``). No alucina el contenido — clipea el
-    borde izquierdo del tramo que copió.
+    WHAT PROBLEM IT SOLVES (measured real case): the prompt says
+    ``Read the file at /home/user/data.json with utf-8`` and the model emits
+    ``path = "home/user/data.json"``: it copies the WHOLE path except the
+    leading punctuation (``/``). It does not hallucinate the content — it
+    clips the left edge of the span it copied.
 
-    LA REGLA (tres pasos):
-    1. Si el valor aparece LITERALMENTE en la query (substring exacto),
-       ubica esa ocurrencia con ``find``.
-    2. Mira el char inmediatamente a la izquierda. Si es PUNTUACIÓN (no
-       whitespace, no comilla, no alfanumérico), ese char era parte del valor
-       y el modelo lo perdió: estirá el valor hacia la izquierda hasta el
-       primer borde.
-    3. Si ya arranca en un borde, o no aparece en la query, no toca nada.
+    THE RULE (three steps):
+    1. If the value appears LITERALLY in the query (exact substring), locate
+       that occurrence with ``find``.
+    2. Look at the char immediately to the left. If it is PUNCTUATION (not
+       whitespace, not quote, not alphanumeric), that char was part of the
+       value and the model lost it: stretch the value left until the first
+       boundary.
+    3. If it already starts on a boundary, or does not appear in the query,
+       touch nothing.
 
-    POR QUÉ FRENA EN ESOS CHAR (contraejemplos que fijan la frontera):
-    - ``"llo"`` dentro de ``"hello"``: a la izquierda hay ``e`` (alfanumérico)
-      → NO se estira. Sin este freno, "las últimas 3 letras de hello"
-      devolvería "hello" entero.
-    - ``"hello"`` dentro de ``'hello'``: a la izquierda hay ``'`` (comilla) →
-      NO se estira. La comilla es el DELIMITADOR del valor, no su contenido:
-      sin este freno se rompían los tests públicos de ``'hello'``/``'world'``
-      (``hello`` → ``'hello``).
-    - ``"C:\\Users\\john\\config.ini"`` (test privado 9): a la izquierda hay
-      espacio → NO se estira. Por eso un path Windows (que no arranca con
-      ``/``) queda intacto: la regla NO asume "todo path empieza con /".
+    WHY IT STOPS ON THOSE CHARS (counterexamples that fix the boundary):
+    - ``"llo"`` inside ``"hello"``: to the left there is ``e`` (alphanumeric)
+      → do NOT stretch. Without this brake, "the last 3 letters of hello"
+      would return the whole "hello".
+    - ``"hello"`` inside ``'hello'``: to the left there is ``'`` (quote) →
+      do NOT stretch. The quote is the VALUE's DELIMITER, not its content:
+      without this brake the public tests of ``'hello'``/``'world'``
+      broke (``hello`` → ``'hello``).
+    - ``"C:\\Users\\john\\config.ini"``: to the left there is a space →
+      do NOT stretch. That is why a Windows path (which does not start
+      with ``/``) stays intact: the rule does NOT assume "every path
+      starts with /".
 
-    LÍMITE CONOCIDO: usa la PRIMERA ocurrencia (``find``). Si el mismo valor
-    aparece varias veces con bordes distintos, sólo considera la primera.
-    Ninguno de los 22 casos medidos (11 públicos + 11 privados) lo ejercita.
+    KNOWN LIMIT: it uses the FIRST occurrence (``find``). If the same value
+    appears multiple times with different boundaries, only the first is
+    considered. None of the 22 measured cases (11 public + 11 private)
+    exercises this.
     """
     if not value:
         return value
@@ -140,37 +143,39 @@ def _snap_to_query_span(value: str, prompt: str) -> str:
 
 
 def _restore_internal_quotes(value: str, prompt: str) -> str:
-    """Restaura las comillas dobles INTERNAS que el modelo se comió al copiar.
+    """Restore the INTERNAL double quotes the model ate while copying.
 
-    QUÉ PROBLEMA RESUELVE (caso real medido, test privado 11):
-    el prompt dice ``Format template: Say "hello" to {name}`` y el modelo emite
-    ``template = "Say hello to {name}"``: copió perfecto el contenido pero se
-    comió las comillas que delimitan ``hello`` dentro del valor.
+    WHAT PROBLEM IT SOLVES (measured real case): the prompt says
+    ``Format template: Say "hello" to {name}`` and the model emits
+    ``template = "Say hello to {name}"``: it copied the content perfectly
+    but ate the quotes delimiting ``hello`` inside the value.
 
-    LA REGLA (cinco pasos):
-    1. Se borran TODAS las comillas dobles de la query, guardando el mapa de
-       índices para poder volver a las coordenadas originales.
-    2. Se buscan todas las ocurrencias del valor en esa query mutilada.
-    3. De cada una se recupera el slice ORIGINAL que le corresponde (incluye
-       las comillas que el paso 1 se había saltado).
-    4. Se descartan los slices que (a) son idénticos al valor —no hay nada que
-       restaurar— o (b) empiezan o terminan en comilla.
-    5. Si queda EXACTAMENTE UNO, se devuelve. Si queda cero o más de uno, se
-       devuelve el valor sin tocar.
+    THE RULE (five steps):
+    1. Delete ALL double quotes from the query, keeping the index map to
+       get back to the original coordinates.
+    2. Find every occurrence of the value in that mutilated query.
+    3. Recover the ORIGINAL slice each one corresponds to (it includes the
+       quotes step 1 skipped).
+    4. Discard slices that (a) are identical to the value —nothing to
+       restore— or (b) start or end with a quote.
+    5. If EXACTLY ONE remains, return it. If zero or more than one remain,
+       return the value untouched.
 
-    POR QUÉ SE DESCARTAN LAS COMILLAS DE LOS BORDES (el contraejemplo que
-    define la regla): el prompt ``Replace all numbers in "Hello 34 I'm 233
-    years old" with NUMBERS`` tiene el valor entre comillas, pero esas comillas
-    son el MARCO de la frase, no su contenido: el valor esperado es el texto
-    SIN ellas. Sin este filtro, la regla le agregaría las comillas y rompería
-    ese test público —y también el de ``Reverse the string 'hello'``.
+    WHY EDGE QUOTES ARE DISCARDED (the counterexample that defines the
+    rule): the prompt ``Replace all numbers in "Hello 34 I'm 233
+    years old" with NUMBERS`` has the value inside quotes, but those quotes
+    are the phrase's FRAME, not its content: the expected value is the text
+    WITHOUT them. Without this filter the rule would add the quotes back
+    and break that public test — and also the one for
+    ``Reverse the string 'hello'``.
 
-    POR QUÉ EXIGE UN SOLO CANDIDATO: sin esa exigencia la regla empieza a
-    adivinar. En ``Say "hello" and hello`` hay dos ocurrencias y la correcta es
-    NO tocar nada; con ``Use "a" or "b" for {x}`` el valor ``a`` aparece
-    dentro de palabras ("Form**a**t"), así que la evidencia es ambigua. Ante
-    duda, se queda callada: el costo de callarse es un test igual de fallado,
-    y el costo de adivinar es romper los 38 valores que hoy funcionan.
+    WHY IT REQUIRES A SINGLE CANDIDATE: without that requirement the rule
+    starts guessing. In ``Say "hello" and hello`` there are two occurrences
+    and the correct action is to touch nothing; with ``Use "a" or "b" for
+    {x}`` the value ``a`` appears inside words ("Form**a**t"), so the
+    evidence is ambiguous. When in doubt it stays silent: the cost of
+    silence is one equally failed test, and the cost of guessing is
+    breaking the 38 values that currently pass.
     """
     if not value:
         return value
@@ -189,8 +194,8 @@ def _restore_internal_quotes(value: str, prompt: str) -> str:
         found = stripped.find(value, start)
         if found < 0:
             break
-        # `end` es exclusivo sobre `stripped`; `positions[end - 1]` es el
-        # último carácter del slice y por eso el +1 del corte en `prompt`.
+        # `end` is exclusive over `stripped`; `positions[end - 1]` is the
+        # last character of the slice, hence the +1 in the `prompt` cut.
         end = found + len(value)
         original = prompt[positions[found]:positions[end - 1] + 1]
         start = found + 1
@@ -206,44 +211,43 @@ def _restore_internal_quotes(value: str, prompt: str) -> str:
 
 
 def _collapse_repeated_run(value: str, prompt: str) -> str:
-    """Deshace el conteo cuando el modelo repitió un carácter por cada match.
+    """Undo the counting when the model repeated a character per match.
 
-    QUÉ PROBLEMA RESUELVE (caso real medido, test público 9):
-    el prompt dice ``Replace all vowels in 'Programming is fun' with
-    asterisks`` y el modelo emite ``replacement = "****"``. En cualquier API de
-    sustitución —``re.sub`` de Python, ``sed``, ``replace`` de JavaScript— el
-    ``replacement`` es una PLANTILLA que se aplica a todas las coincidencias,
-    no una copia por coincidencia. El modelo contó las vocales y escribió una
-    estrella por vocal: ejecutó la instrucción en vez de parametrizarla. El
-    valor correcto es el carácter repetido UNA vez.
+    WHAT PROBLEM IT SOLVES (measured real case): the prompt says
+    ``Replace all vowels in 'Programming is fun' with asterisks`` and the
+    model emits ``replacement = "****"``. In any substitution API — Python's
+    ``re.sub``, ``sed``, JavaScript's ``replace`` — the ``replacement`` is a
+    TEMPLATE applied to every match, not a copy per match. The model counted
+    the vowels and wrote one star per vowel: it executed the instruction
+    instead of parameterizing it. The correct value is the character
+    repeated ONCE.
 
-    LA REGLA (cuatro pasos):
-    1. El valor tiene que ser ENTERAMENTE una corrida de >= 2 caracteres
-       idénticos.
-    2. Esa corrida NO puede aparecer literal en la query: si el modelo la
-       copió, la repetición es intencional y no se toca.
-    3. Se busca la corrida más larga que la query SÍ muestra y se usa esa.
-    4. Si la query no muestra ninguna, se deja un solo carácter.
+    THE RULE (four steps):
+    1. The value must be ENTIRELY a run of >= 2 identical characters.
+    2. That run must NOT appear literally in the query: if the model copied
+       it, the repetition is intentional and nothing is touched.
+    3. Use the longest run the query DOES show.
+    4. If the query shows none, leave a single character.
 
-    POR QUÉ EL PASO 3 EXISTE (el agujero medido de la versión simple): si la
-    query muestra ``***`` y el modelo cuenta cinco, colapsar siempre a uno
-    devolvería ``*`` en vez de ``***``. La versión "respeta el conteo de la
-    query" devuelve ``***``. En el caso real la query no muestra ninguna
-    corrida —dice "asterisks", la palabra inglesa, no el símbolo— y por eso
-    ahí sí se cae al paso 4.
+    WHY STEP 3 EXISTS (the measured hole in the simple version): if the
+    query shows ``***`` and the model counts five, always collapsing to one
+    would return ``*`` instead of ``***``. The "respect the query's count"
+    version returns ``***``. In the real case the query shows no run at all
+    — it says "asterisks", the English word, not the symbol — so that case
+    does fall through to step 4.
 
-    POR QUÉ EXIGE QUE EL VALOR ENTERO SEA LA CORRIDA: una versión más amplia
-    que reconociera "un bloque repetido" (tipo ``ababab`` -> ``ab``) está
-    ROTA — sobre el caso real devolvería ``**`` en vez de ``*``, porque una
-    corrida de cuatro iguales también es "un bloque de dos repetido dos
-    veces". Medido: esa variante baja el set público de 11/11 a 10/11. Los
-    valores legítimos con repetición (``utf-8``, ``/home/user/data.json``,
-    ``NUMBERS``, ``dog``) tienen caracteres distintos y quedan intactos.
+    WHY IT REQUIRES THE WHOLE VALUE TO BE THE RUN: a broader version that
+    recognized "a repeated block" (like ``ababab`` -> ``ab``) is BROKEN —
+    on the real case it would return ``**`` instead of ``*``, because a run
+    of four identical chars is also "a block of two repeated twice".
+    Measured: that variant drops the public set from 11/11 to 10/11. The
+    legitimate values with repetition (``utf-8``, ``/home/user/data.json``,
+    ``NUMBERS``, ``dog``) have distinct characters and stay intact.
 
-    NOTA DE LEGITIMIDAD: la regla se apoya en una FIRMA ESTRUCTURAL (la
-    corrida de caracteres), no en un vocabulario. Anclar la corrección a la
-    palabra "asterisks" sería una tabla de búsqueda hardcodeada y está
-    prohibido por el subject; anclarla a la forma de la salida no.
+    LEGITIMACY NOTE: the rule leans on a STRUCTURAL SIGNATURE (the run of
+    characters), not on a vocabulary. Anchoring the correction to the word
+    "asterisks" would be a hardcoded lookup table and the subject forbids
+    it; anchoring it to the shape of the output is fine.
     """
     if len(value) < 2:
         return value
@@ -259,20 +263,21 @@ def _collapse_repeated_run(value: str, prompt: str) -> str:
 
 
 def _repair_string_value(value: str, prompt: str) -> str:
-    """Aplica las tres reparaciones post-hoc, en orden, y la primera gana.
+    """Apply the three post-hoc repairs in order; the first one that fixes wins.
 
-    POR QUÉ "LA PRIMERA QUE CORRIGE GANA" y no las tres en cadena: cada regla
-    exige la evidencia que la anterior no tenía. `_snap_to_query_span` sólo
-    dispara si el valor ES un substring de la query. Si no lo es, A no debía
-    tocar nada, así que la cadena sigue a `_restore_internal_quotes`, que
-    exige que aparezca al quitar las comillas. Y `_collapse_repeated_run`
-    sólo mira corridas de caracteres idénticos, forma que B nunca produce
-    (B devuelve slices con comillas, que no son corridas). Son disjuntas por
-    construcción, y esta forma lo hace explícito en el código.
+    WHY "FIRST ONE THAT FIXES WINS" and not all three chained: each rule
+    requires evidence the previous one did not have. `_snap_to_query_span`
+    only fires if the value IS a substring of the query. If it is not, A
+    should not touch anything, so the chain moves on to
+    `_restore_internal_quotes`, which requires it to appear once quotes are
+    removed. And `_collapse_repeated_run` only looks at runs of identical
+    characters, a shape B never produces (B returns slices with quotes,
+    which are not runs). They are disjoint by construction, and this form
+    makes that explicit in the code.
 
-    El orden NO es arbitrario: A es la regla ya verificada y commiteada, así
-    que si B o C tuvieran un defecto, el comportamiento previo queda cubierto
-    por el regression suite.
+    The order is NOT arbitrary: A is the rule already verified and
+    covered, so if B or C had a defect the previous behavior remains
+    covered by the regression suite.
     """
     snapped = _snap_to_query_span(value, prompt)
     if snapped != value:
@@ -284,44 +289,45 @@ def _repair_string_value(value: str, prompt: str) -> str:
 
 
 def build_function_call(prompt: str, payload: dict[str, object]) -> FunctionCall:
-    """Construye un FunctionCall validado desde (prompt, payload parseado).
+    """Build a validated FunctionCall from (prompt, parsed payload).
 
     Args:
-        prompt: El request natural ORIGINAL (no el prompt con las function
-            definitions inyectadas). La moulinette lo compara con
-            `correction["prompt"]` por igualdad EXACTA de string, así que
-            tiene que ser el texto del input, byte a byte.
-        payload: Dict con las keys `name` y `parameters` (o `name` sola).
+        prompt: The ORIGINAL natural request (not the prompt with the
+            function definitions injected). The grader compares it with
+            `correction["prompt"]` by EXACT string equality, so it must be
+            the input text, byte for byte.
+        payload: Dict with the keys `name` and `parameters` (or `name` alone).
 
     Returns:
-        ``FunctionCall`` con los tres campos del subject V.4.
+        ``FunctionCall`` with the three fields the subject requires.
 
     Raises:
-        pydantic.ValidationError: si falta `name` o los tipos no cierran.
+        pydantic.ValidationError: if `name` is missing or types do not add up.
     """
     name = payload.get("name")
     parameters = payload.get("parameters", {})
     raw_parameters = parameters if isinstance(parameters, dict) else {}
-    # Aplica las TRES reparaciones post-hoc a cada value string (ver
-    # `_repair_string_value`). Las tres corrigen la misma clase de defecto: el
-    # modelo es un copiador y deforma la frase mientras copia — la recorta
-    # (A), le come las comillas internas (B), o cuenta repeticiones en vez de
-    # parametrizar (C). Los no-string (números, bools, null) pasan intactos: el
-    # proyecto limita los params a escalares (models/output.py).
+    # Applies the THREE post-hoc repairs to each string value (see
+    # `_repair_string_value`). All three correct the same class of defect: the
+    # model is a copier and deforms the phrase while copying — it clips it
+    # (A), eats the internal quotes (B), or counts repetitions instead of
+    # parameterizing (C). Non-strings (numbers, bools, null) pass through
+    # untouched: the project limits params to scalars (models/output.py).
     repaired_parameters = {
         key: _repair_string_value(value, prompt) if isinstance(value, str) else value
         for key, value in raw_parameters.items()
     }
     return FunctionCall(
         prompt=prompt,
-        # `name` viene como object del json.loads; pydantic lo valida como str.
-        # Si el decoder garantiza un string, el isinstance es defensivo y
-        # nunca falla en la práctica — pero sin él, mypy se quejaría de
-        # pasar `object` donde se espera `str`.
+        # `name` comes as object from json.loads; pydantic validates it as str.
+        # If the decoder guarantees a string, the isinstance is defensive and
+        # never fails in practice — but without it, mypy would complain about
+        # passing `object` where `str` is expected.
         name=name if isinstance(name, str) else str(name),
-        # `raw_parameters` es `object` para mypy (viene de `payload`); el
-        # isinstance de arriba ya lo estrechó a dict. El default {} cubre el
-        # caso "el decoder emitió solo el name" (fn sin parámetros).
+        # The values stay `object` to mypy (they come from `payload`); the
+        # isinstance above already narrowed `parameters` to a dict. The
+        # default {} covers "the decoder emitted only the name" (a fn
+        # without parameters).
         parameters=repaired_parameters,
     )
 
@@ -330,27 +336,26 @@ def validate_output(
     raw: str,
     functions: list[FunctionDef],
 ) -> FunctionCall | str:
-    """Valida una generación contra las definiciones disponibles.
+    """Validate one generation against the available definitions.
 
     Args:
-        raw: Texto del decoder para UN prompt.
-        functions: Definiciones cargadas del input.
+        raw: Decoder text for ONE prompt.
+        functions: Definitions loaded from the input.
 
     Returns:
-        ``FunctionCall`` si la generación es válida y su `name` existe en
-        ``functions``; o un string de error si algo falla.
+        ``FunctionCall`` if the generation is valid and its `name` exists in
+        ``functions``; or an error string if something fails.
 
-    POR QUÉ devuelve `FunctionCall | str` en vez de lanzar:
-    El subject (V.5) pide que el programa "must never crash unexpectedly"
-    y que los prompts problemáticos no maten el pipeline. Devolver el error
-    como valor deja que el caller lo loguee y siga con el siguiente prompt.
+    WHY it returns `FunctionCall | str` instead of raising:
+    The subject requires the program to "must never crash unexpectedly"
+    and problem prompts must not kill the pipeline. Returning the error as
+    a value lets the caller log it and continue with the next prompt.
 
-    NOTA sobre la validación de `name`:
-    Verificamos que el nombre EXISTA en las definiciones, pero NO que los
-    parameters coincidan con el schema de esa función. Esa validación más
-    profunda es la Task 5.1 completa (ver PLAN_EJECUCION_V2 Etapa 1) y queda
-    fuera de este primer corte: lo que resuelve el bloqueo del entregable es
-    que el archivo exista y sea parseable, no que sea semánticamente perfecto.
+    NOTE on `name` validation:
+    We check that the name EXISTS in the definitions, but NOT that the
+    parameters match that function's schema. That deeper validation is
+    still pending: what unblocks the deliverable is that the file exists
+    and is parseable, not that it be semantically perfect.
     """
     try:
         payload = parse_output(raw)
@@ -375,16 +380,16 @@ def build_results(
     prompts: list[str],
     generated: list[str],
 ) -> list[FunctionCall]:
-    """Empaqueta (prompts originales, generaciones) en entries de salida.
+    """Package (original prompts, generations) into output entries.
 
     Args:
-        prompts: Requests originales, en el MISMO orden que `generated`.
-        generated: Strings del decoder, uno por prompt.
+        prompts: Original requests, in the SAME order as `generated`.
+        generated: Decoder strings, one per prompt.
 
     Returns:
-        Una entry por prompt, EN ORDEN. Nunca se omiten entries: si una
-        generación no se puede parsear, se emite un placeholder en esa
-        posición para no romper el `zip()` posicional de la moulinette.
+        One entry per prompt, IN ORDER. Entries are never skipped: if a
+        generation cannot be parsed, a placeholder is emitted at that
+        position to keep the grader's positional `zip()` intact.
     """
     results: list[FunctionCall] = []
     for i, raw_prompt in enumerate(prompts):
@@ -395,7 +400,7 @@ def build_results(
                 raise ValueError(f"not a JSON object: {type(payload).__name__}")
             results.append(build_function_call(raw_prompt, payload))
         except (json.JSONDecodeError, ValueError) as exc:
-            # Placeholder alineado: este test va a fallar, los demás no.
+            # Aligned placeholder: this test will fail, the others won't.
             results.append(
                 FunctionCall(
                     prompt=raw_prompt,
@@ -403,8 +408,8 @@ def build_results(
                     parameters={},
                 )
             )
-            # El warning va a stderr, que es el stream de diagnóstico
-            # (ver la nota sobre stdout/stderr en __main__.py).
+            # The warning goes to stderr, the diagnostics stream
+            # (see the stdout/stderr note in __main__.py).
             print(
                 f"WARNING: prompt {i} produced unparseable output ({exc}); "
                 f"emitted placeholder to keep positional alignment",
@@ -414,20 +419,20 @@ def build_results(
 
 
 def _text_forms(value: object) -> list[str]:
-    """Representaciones textuales con las que un valor puede estar en un prompt.
+    """Textual representations a value can take in a prompt.
 
-    POR QUÉ MÁS DE UNA FORMA: el decoder escribe los floats con punto decimal
-    (`2.0`), pero el humano escribe el número sin él ("sum 2 and 3"). Si sólo
-    aceptáramos `"2.0"` como evidencia de soporte, ese prompt legítimo
-    dispararía un warning falso. Por eso un float entero devuelve las dos
-    formas.
+    WHY MORE THAN ONE FORM: the decoder writes floats with a decimal point
+    (`2.0`), but humans write the number without one ("sum 2 and 3"). If we
+    only accepted `"2.0"` as supporting evidence, that legitimate prompt
+    would fire a false warning. That is why an integral float returns both
+    forms.
 
-    Devuelve `[]` para valores sin forma textual comparable (bool, None) —
-    el caller los trata como "no juzgables" en vez de "no soportados".
+    Returns `[]` for values with no comparable textual form (bool, None) —
+    the caller treats them as "not judgeable" rather than "unsupported".
     """
     if isinstance(value, bool):
-        # `bool` es subclase de `int`: hay que chequearlo ANTES que int o
-        # True se reportaría como "1".
+        # `bool` is a subclass of `int`: must be checked BEFORE int or
+        # True would be reported as "1".
         return []
     if isinstance(value, int):
         return [str(value)]
@@ -445,43 +450,42 @@ def find_unsupported_prompts(
     prompts: list[str],
     results: list[FunctionCall],
 ) -> list[int]:
-    """Índices de los prompts cuya llamada no tiene NINGÚN valor respaldado
-    por el texto del prompt.
+    """Indices of prompts whose call has NO value backed by the prompt text.
 
-    QUÉ HACE: el decoder restringido SIEMPRE emite una función válida — la
-    gramática no permite otra cosa. Para un prompt que no corresponde a
-    ninguna función, eso degenera en que el modelo elige la que "menos feo"
-    queda: no crashea, pero tampoco avisa. Ejemplo real medido:
+    WHAT IT DOES: the constrained decoder ALWAYS emits a valid function —
+    the grammar allows nothing else. For a prompt that maps to no function,
+    this degenerates into the model choosing whichever looks "least ugly":
+    it does not crash, but it does not warn either. Measured real case:
     *"What is the weather in Paris tomorrow?"* → `fn_get_square_root(a=100.0)`.
-    Esto detecta ese caso y lo reporta.
+    This detects that case and reports it.
 
-    EL CRITERIO, y por qué es simple a propósito: si NINGÚN valor de
-    parámetro aparece (literal, sin distinguir mayúsculas) en el prompt, la
-    llamada no está respaldada por la entrada — el modelo se inventó hasta los
-    argumentos. Con que UNO aparezca, no se reporta: el caso borderline
-    (P9, donde `replacement="****"` no está en el prompt pero `source_string`
-    y `regex` sí) es un fallo de accuracy del modelo, no una falta de match,
-    y el corretero ya lo mide.
+    THE CRITERION, and why it is simple on purpose: if NO parameter value
+    appears (literal, case-insensitive) in the prompt, the call is not
+    backed by the input — the model invented even the arguments. If even
+    ONE appears, it is not reported: the borderline case (where
+    `replacement="****"` is not in the prompt but `source_string` and
+    `regex` are) is a model accuracy failure, not a match failure, and the
+    evaluation harness already measures it.
 
-    LO QUE ESTE MÓDULO **NO** ES — importante para la corrección del subject:
-    el subject dice que "the function to call should be chosen using the LLM,
-    not with heuristics". Acá NO se elige nada: la función ya la eligió el LLM
-    en constrained decoding. Esta función es un sensor de SALIDA para una
-    persona, no una decisión. No toca el archivo de resultados y no altera el
-    score.
+    WHAT THIS MODULE IS **NOT** — important for subject compliance:
+    the subject says "the function to call should be chosen using the LLM,
+    not with heuristics". Nothing is chosen here: the LLM already chose the
+    function during constrained decoding. This function is an OUTPUT SENSOR
+    for a human, not a decision. It does not touch the results file and
+    does not alter the score.
 
     Args:
-        prompts: Requests originales (texto crudo, sin las defs inyectadas).
-        results: Entries ya construidas por `build_results`.
+        prompts: Original requests (raw text, without the injected defs).
+        results: Entries already built by `build_results`.
 
     Returns:
-        Índices (base 0) de los prompts sin respaldo textual. Vacío = todo OK.
+        Zero-based indices of prompts without textual support. Empty = all OK.
     """
     unsupported: list[int] = []
     for i, call in enumerate(results):
-        # El sentinel ya tiene su propio warning (no parseable) y no tiene
-        # argumentos que juzgar. Las funciones sin parámetros tampoco son
-        # juzgables: no hay con qué comparar contra el prompt.
+        # The sentinel already got its own warning (unparseable) and has no
+        # arguments to judge. Parameter-less functions are not judgeable
+        # either: there is nothing to compare against the prompt.
         if call.name == _UNKNOWN_FN_SENTINEL or not call.parameters:
             continue
         if i >= len(prompts):

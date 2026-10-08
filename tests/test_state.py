@@ -1,4 +1,4 @@
-"""Unit tests for the constrained JSON decoder state machine (Task 3.1)."""
+"""Unit tests for the constrained JSON decoder state machine."""
 
 from __future__ import annotations
 
@@ -65,8 +65,8 @@ class TestFullJsonHappyPath:
         assert s.keys_enclosed == {"a", "b"}
 
     def test_name_only_syntactically_ok(self) -> None:
-        # Sin "parameters": sintácticamente válido; el schema validator
-        # (Task 3.3) lo rechazará porque parameters es required.
+        # Without "parameters": syntactically valid; the schema validator
+        # will reject it because parameters is required.
         s = DecoderState()
         assert s.update_from_text('{"name":"fn"}')
         assert s.phase == DecoderPhase.COMPLETE
@@ -95,12 +95,12 @@ class TestSimulate:
         s = DecoderState()
         ok, ns = s.simulate("x")
         assert not ok
-        assert ns is s  # spec A6.4: se retorna el estado ORIGINAL al fallar
+        assert ns is s  # on failure it returns the ORIGINAL state
         assert s.phase == DecoderPhase.ROOT
 
     def test_multi_char_token_whitespace_prefix(self) -> None:
-        # Los tokens BPE de Qwen decodifican "Ġx" como " x": un token puede
-        # arrancar con espacio Y contener '{' — no hay estado intermedio.
+        # Qwen BPE tokens decode "Ġx" as " x": one token may start with a
+        # space AND contain '{' — there is no intermediate state.
         s = DecoderState()
         ok, ns = s.simulate(' \n{"name')
         assert ok
@@ -113,17 +113,17 @@ class TestUpdateFromTextAtomic:
         s = DecoderState()
         assert s.update_from_text('{"name":')
         before = s.phase
-        assert not s.update_from_text('"fn"}x')  # "x" tras COMPLETE
+        assert not s.update_from_text('"fn"}x')  # "x" after COMPLETE
         assert s.phase == before
 
     def test_split_across_calls(self) -> None:
-        # Los tokens cortan keys y values a la mitad: cada update_from_text
-        # retoma desde el estado acumulado del anterior.
+        # Tokens cut keys and values in half: every update_from_text
+        # resumes from the accumulated state of the previous one.
         s = DecoderState()
         assert s.update_from_text('{"na')
         assert s.phase == DecoderPhase.IN_KEY
         assert s.update_from_text('me":"fn"}')
-        assert s.phase == DecoderPhase.COMPLETE
+        assert s.phase == DecoderPhase.COMPLETE  # type: ignore[comparison-overlap]
 
     def test_number_split_across_calls(self) -> None:
         s = DecoderState()
@@ -161,13 +161,13 @@ class TestNumbers:
     INVALID = [
         '{"name":"fn","parameters":{"a":01}}',       # leading zero
         '{"name":"fn","parameters":{"a":-01}}',
-        '{"name":"fn","parameters":{"a":2.}}',       # fracción sin dígitos
-        '{"name":"fn","parameters":{"a":2e}}',       # exponente sin dígitos
+        '{"name":"fn","parameters":{"a":2.}}',       # fraction without digits
+        '{"name":"fn","parameters":{"a":2e}}',       # exponent without digits
         '{"name":"fn","parameters":{"a":2e+}}',
         '{"name":"fn","parameters":{"a":2e+-3}}',
         '{"name":"fn","parameters":{"a":2..5}}',
-        '{"name":"fn","parameters":{"a":.5}}',       # int part obligatorio
-        '{"name":"fn","parameters":{"a":+2}}',       # '+' inicial inválido
+        '{"name":"fn","parameters":{"a":.5}}',       # int part is mandatory
+        '{"name":"fn","parameters":{"a":+2}}',       # leading '+' is invalid
     ]
 
     def test_invalid_numbers_rejected(self) -> None:
@@ -184,7 +184,7 @@ class TestNumbers:
     def test_leading_zero_blocked_char_by_char(self) -> None:
         s = DecoderState()
         assert s.update_from_text('{"parameters":{"a":0')
-        assert not s._advance_char("1")  # "01" no es número JSON
+        assert not s._advance_char("1")  # "01" is not a JSON number
 
 
 class TestBooleansAndNull:
@@ -240,7 +240,7 @@ class TestStringsAndEscapes:
         assert not s.update_from_text('{"parameters":{"a":"\\u00g9"}}')
 
     def test_unicode_escape_too_short(self) -> None:
-        # Solo 3 hex antes del '"': el '"' NO es hex -> inválido.
+        # Only 3 hex before the '"': the '"' is NOT hex -> invalid.
         s = DecoderState()
         assert not s.update_from_text('{"parameters":{"a":"\\u00e"}}')
 
@@ -257,19 +257,19 @@ class TestWhitespaceTolerance:
         assert s.phase == DecoderPhase.COMPLETE
 
     def test_whitespace_closes_value_without_consuming_terminal(self) -> None:
-        # ws tras el number cierra el value (VALUE_END) y deja que el '}'
-        # real cierre el objeto: dos transiciones, no una.
+        # ws after the number closes the value (VALUE_END) and lets the real
+        # '}' close the object: two transitions, not one.
         s = DecoderState()
         assert s.update_from_text('{"parameters":{"a":2 }')
         assert s.phase == DecoderPhase.VALUE_END
         assert s.keys_enclosed == {"a"}
         assert s.update_from_text("}")
-        assert s.phase == DecoderPhase.COMPLETE
+        assert s.phase == DecoderPhase.COMPLETE  # type: ignore[comparison-overlap]
 
     def test_whitespace_not_allowed_inside_key(self) -> None:
         s = DecoderState()
-        # En IN_KEY el espacio es CONTENIDO de la key (identificadores del
-        # schema no tienen espacios; el filter/schema lo descarta después).
+        # In IN_KEY a space is CONTENT of the key (schema identifiers have no
+        # spaces; the filter/schema discards it afterwards).
         assert s.update_from_text('{"na me":1}')
         assert s.phase == DecoderPhase.COMPLETE
 
@@ -279,11 +279,11 @@ class TestComplete:
         s = DecoderState()
         assert s.update_from_text('{"name":"fn","parameters":{}}')
         assert s.phase == DecoderPhase.COMPLETE
-        assert s.keys_enclosed == set()  # schema validator exige required keys
+        assert s.keys_enclosed == set()  # the schema validator demands required keys
 
     def test_extra_key_after_params_ok(self) -> None:
-        # La state machine es schema-agnóstica: JSON válido con más keys.
-        # El schema validator (Task 3.3) rechaza keys desconocidas.
+        # The state machine is schema-agnostic: valid JSON with extra keys.
+        # The schema validator rejects unknown keys.
         s = DecoderState()
         assert s.update_from_text('{"name":"fn","parameters":{},"extra":1}')
         assert s.phase == DecoderPhase.COMPLETE
@@ -321,13 +321,13 @@ class TestExpectedFirstChars:
         assert s.update_from_text('{"parameters":{"a":2')
         e = s.expected_first_chars()
         assert {"0", "9", ".", "e", "E", ",", "}"} <= e
-        assert "-" not in e  # tras "2", un '-' es inválido
+        assert "-" not in e  # after "2", a '-' is invalid
 
-        assert s.update_from_text(".")  # buffer "2.": fracción pendiente
+        assert s.update_from_text(".")  # buffer "2.": fraction pending
         e = s.expected_first_chars()
         assert "3" in e
-        assert "e" not in e  # "2.e" no existe
-        assert "," not in e  # "2," es inválido: la fracción exige dígitos
+        assert "e" not in e  # "2.e" does not exist
+        assert "," not in e  # "2," is invalid: the fraction needs digits
 
         assert s.update_from_text("5")  # buffer "2.5" -> now complete
         e = s.expected_first_chars()
@@ -340,10 +340,10 @@ class TestExpectedFirstChars:
         assert {"0", "+", "-"} <= e
         assert "." not in e
 
-        assert s.update_from_text("+")  # "2e+": falta el dígito
+        assert s.update_from_text("+")  # "2e+": the digit is missing
         e = s.expected_first_chars()
         assert "9" in e
-        assert "-" not in e  # "2e+-" es inválido
+        assert "-" not in e  # "2e+-" is invalid
 
     def test_bool_continuations(self) -> None:
         s = DecoderState()
@@ -367,7 +367,7 @@ class TestExpectedFirstChars:
         assert s.update_from_text('{"parameters":{"a":"\\u00')
         e = s.expected_first_chars()
         assert "0" in e and "f" in e and "A" in e
-        assert '"' not in e  # no cierra el string mientras falten hex
+        assert '"' not in e  # does not close the string while hex is missing
 
     def test_wildcard_for_open_states(self) -> None:
         s = DecoderState()
@@ -385,56 +385,56 @@ class TestExpectedFirstChars:
 
 
 class TestNameBuffer:
-    """⚠ Desvío documentado (Task 3.3): la máquina acumula el value de "name".
+    """Documented deviation: the machine accumulates the "name" value.
 
-    Solamente el value de la key "name" del OUTPUT object (depth 0) entra al
-    buffer; estructura, keys y values de parameters NO lo tocan. Los escapes
-    se skippean: el buffer queda con el nombre "decodificado".
+    Only the value of the OUTPUT object's "name" key (depth 0) enters the
+    buffer; structure, keys and values of parameters do NOT touch it. Escapes
+    are skipped: the buffer keeps the "decoded" name.
     """
 
     def test_accumulates_only_name_value_chars(self) -> None:
         s = DecoderState()
         assert s.update_from_text('{"name": "fn_add_numbers"')
         assert s.name_buffer == "fn_add_numbers"
-        # Estructura posterior (incluida la key "parameters" y sus values)
-        # NO entra al buffer ni lo pisa.
+        # Subsequent structure (including the "parameters" key and its values)
+        # does NOT enter the buffer or overwrite it.
         assert s.update_from_text(', "parameters": {"a": 2.0}')
         assert s.name_buffer == "fn_add_numbers"
 
     def test_param_named_name_does_not_fill_buffer(self) -> None:
-        """fn_greet tiene un parámetro "name" (depth 1): no debe entrar."""
+        """fn_greet has a "name" parameter (depth 1): it must not enter."""
 
         s = DecoderState()
         assert s.update_from_text('{"name": "fn_greet", "parameters": {')
         assert s.name_buffer == "fn_greet"
         assert s.update_from_text('"name": "Javier"}')
-        # El value del parámetro "name" NO se acumula (depth == 1).
+        # The value of the "name" parameter is NOT accumulated (depth == 1).
         assert s.name_buffer == "fn_greet"
 
     def test_escape_rejected_in_name_value(self) -> None:
-        """BUG-011 (2026-09-24): un escape dentro del value de "name" se
-        rechaza AL LEER el '\\' — antes se skippeaba silenciosamente del
-        buffer, lo que dejaba el prefijo del trie intacto y permitía un
-        loop infinito de escapes en el generador (repro real: 'Greet
-        shrek' nunca cerraba el string). Ningún nombre real usa '\\'."""
+        """An escape inside the "name" value is rejected WHEN READING the '\\'
+        — it used to be silently skipped from the buffer, which left the trie
+        prefix intact and allowed an infinite loop of escapes in the generator
+        (real repro: 'Greet shrek' never closed the string). No real name uses
+        '\\'."""
 
         s = DecoderState()
         assert s.update_from_text('{"name": "f')
         assert not s.update_from_text("\\n_greet")
-        # Atómico: el estado no se movió, name_buffer sigue en "f".
+        # Atomic: the state did not move, name_buffer is still "f".
         assert s.name_buffer == "f"
 
     def test_escapes_still_skipped_for_non_name_buffer_paths(self) -> None:
-        """El skip de escapes en name_buffer (Task 3.3) sigue vigente para
-        lo único que puede tocarlo: value de "name" SIN escapes. Esto solo
-        confirma que la acumulación normal (sin '\\') no cambió."""
+        """The escape skip in name_buffer is still in force for the only path
+        that can touch it: the "name" value WITHOUT escapes. This only confirms
+        that normal accumulation (without '\\') did not change."""
 
         s = DecoderState()
         assert s.update_from_text('{"name": "fn_greet"')
         assert s.name_buffer == "fn_greet"
 
     def test_name_buffer_resets_on_new_name_value(self) -> None:
-        """Un segundo value de "name" (sintácticamente válido) resetea."""
+        """A second "name" value (syntactically valid) resets it."""
 
         s = DecoderState()
         assert s.update_from_text('{"name": "fn_add_numbers", "parameters": {}')

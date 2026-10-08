@@ -29,7 +29,7 @@ from src.decoder.constrained_generator import (
     _float_tail,
     _inject_float_tail,
     _commit_static_text,
-    _next_static_text,
+    _get_next_static_text,
     _passes_fine_validation,
     generate,
 )
@@ -418,7 +418,8 @@ class TestGenerator:
 
 
 # ─── Fase 2: oráculo por estado (tramos estáticos Nivel 1, Anexo 25/09) ──
-# _next_static_text(state, schema, emitted) recorre _TRAMPS (T1-T6, funciones
+# _get_next_static_text(state, schema, generated_text) recorre
+# _STATIC_TEXT_RULES (T1-T6, funciones
 # PURAS) y devuelve el canónico del primer dominio que matchea, alineado al
 # ws final de emitted (E). Estos tests verifican:
 #   * el canónico de CADA tramo (tabla Nivel 1 del Anexo);
@@ -458,14 +459,14 @@ class TestLevel1Oracle:
         # apertura de parameters + la PRIMERA key (fusión T1+ENTRY(K1)).
         state, schema, _vocab, _trie = at_params("fn_add_numbers")
         assert state.phase is DecoderPhase.VALUE_END and state.depth == 0
-        assert _next_static_text(state, schema, "") == T1_CANON_ADD
+        assert _get_next_static_text(state, schema, "") == T1_CANON_ADD
 
     def test_t1_string_param_opens_with_quote(self) -> None:
         # fn_greet: su ÚNICO param es "name" de tipo string → OP(k)='"'.
         # (El param se llama igual que la key del output object: N=1 sigue
         # valiendo porque es el VALUE_END d0 — el param vive a depth 1.)
         state, schema, _vocab, _trie = at_params("fn_greet")
-        assert _next_static_text(state, schema, "") == T1_CANON_GREET
+        assert _get_next_static_text(state, schema, "") == T1_CANON_GREET
 
     def test_t2_fused_comma_token(self) -> None:
         # Token BPE fusionado ('fn_add_numbers",') → IN_OBJECT directo (sin
@@ -473,7 +474,7 @@ class TestLevel1Oracle:
         state, schema, _vocab, _trie = at_params("fn_add_numbers")
         step(state, schema, ",")
         assert state.phase is DecoderPhase.IN_OBJECT
-        assert _next_static_text(state, schema, "") == T2_CANON_ADD
+        assert _get_next_static_text(state, schema, "") == T2_CANON_ADD
 
     def test_empty_params_return_none(self) -> None:
         # DECISIÓN 25/09 (tramo gratis): ord=∅ → T1/T2 devuelven None — el
@@ -482,12 +483,12 @@ class TestLevel1Oracle:
         # el único caso del subject; el probe real confirmó el formato
         # INLINE {}.
         state, schema, _vocab, _trie = at_params("fn_empty")
-        assert _next_static_text(state, schema, "") is None
+        assert _get_next_static_text(state, schema, "") is None
 
     def test_t3_first_required_key(self) -> None:
         # PARAMS_OBJECT d1 con keys pendientes → ENTRY(Knext).
         state, schema, _vocab, _trie = set_params_ctx()
-        assert _next_static_text(state, schema, "") == T3_CANON_FIRST
+        assert _get_next_static_text(state, schema, "") == T3_CANON_FIRST
 
     def test_t3_after_comma(self) -> None:
         # El modelo emitió la coma tras "a" → PARAMS_OBJECT otra vez (en este
@@ -498,7 +499,7 @@ class TestLevel1Oracle:
         step(state, schema, '"a": 2.0')
         step(state, schema, ",")
         assert state.phase is DecoderPhase.PARAMS_OBJECT
-        assert _next_static_text(state, schema, "") == T3_CANON_NEXT
+        assert _get_next_static_text(state, schema, "") == T3_CANON_NEXT
 
     def test_t4_next_key_after_string_value(self) -> None:
         # VALUE_END d1 con pendientes → coma + próxima key. Solo un value
@@ -519,7 +520,7 @@ class TestLevel1Oracle:
             step(state, schema, t)
         step(state, schema, '"x": "Javier"')  # cierra string → VALUE_END d1
         assert state.phase is DecoderPhase.VALUE_END and state.depth == 1
-        assert _next_static_text(state, schema, "") == ',\n    "y": "'
+        assert _get_next_static_text(state, schema, "") == ',\n    "y": "'
 
     def test_t5_close_after_last_string_value(self) -> None:
         # VALUE_END d1 sin pendientes → cierre de parameters + del ROOT.
@@ -529,7 +530,7 @@ class TestLevel1Oracle:
         step(state, schema, '"name": ')
         step(state, schema, '"x"')
         assert state.phase is DecoderPhase.VALUE_END and state.depth == 1
-        assert _next_static_text(state, schema, "") == T5_CANON
+        assert _get_next_static_text(state, schema, "") == T5_CANON
 
     def test_t6_close_root_after_empty_params(self) -> None:
         # fn_empty: tras el '}' del parameters vacío (formato INLINE del
@@ -539,7 +540,7 @@ class TestLevel1Oracle:
         step(state, schema, ', "parameters": {')
         step(state, schema, "}")
         assert state.phase is DecoderPhase.VALUE_END and state.depth == 0
-        assert _next_static_text(state, schema, "") == T6_CANON
+        assert _get_next_static_text(state, schema, "") == T6_CANON
 
     def test_t6_close_root_after_full_params(self) -> None:
         # Post-parameters con todas las keys: VALUE_END d0, N=0 (current_key
@@ -549,7 +550,7 @@ class TestLevel1Oracle:
         step(state, schema, ', "b": 3')
         step(state, schema, "}")  # cierra parameters → d0
         assert state.phase is DecoderPhase.VALUE_END and state.depth == 0
-        assert _next_static_text(state, schema, "") == T6_CANON
+        assert _get_next_static_text(state, schema, "") == T6_CANON
 
     def test_t6_blocked_while_name_open(self) -> None:
         # N=1 (post-name, parameters aún sin abrir) → T6 None: el ROOT NO
@@ -557,7 +558,7 @@ class TestLevel1Oracle:
         # intentara por forward). fn_empty en VALUE_END post-name: T1 ya
         # dio None (ord=∅) y T6 exige N=0 → None total → sigue por forward.
         state, schema, _vocab, _trie = at_params("fn_empty")
-        assert _next_static_text(state, schema, "") is None
+        assert _get_next_static_text(state, schema, "") is None
 
     def test_t6_fused_empty_params_token(self) -> None:
         # HALLazgo del probe real (25/09): el token FUSIONADO ', "parameters":
@@ -569,7 +570,7 @@ class TestLevel1Oracle:
         step(state, schema, ', "parameters": {}')
         assert state.phase is DecoderPhase.VALUE_END and state.depth == 0
         assert not schema.has_seen_params_object()  # el flag NO vio el '{'
-        assert _next_static_text(state, schema, "") == T6_CANON
+        assert _get_next_static_text(state, schema, "") == T6_CANON
 
     def test_bug013_inner_param_name_not_an_opener(self) -> None:
         # BUG-013 (regresión): el param interno "name" de fn_greet (depth 1)
@@ -583,11 +584,11 @@ class TestLevel1Oracle:
         step(state, schema, '"name": ')
         step(state, schema, '"x"')
         assert state.phase is DecoderPhase.VALUE_END and state.depth == 1
-        assert _next_static_text(state, schema, "") == T5_CANON
+        assert _get_next_static_text(state, schema, "") == T5_CANON
 
     def test_initial_root_does_not_match(self) -> None:
         state, schema, _vocab, _trie = make_pipeline()
-        assert _next_static_text(state, schema, "") is None
+        assert _get_next_static_text(state, schema, "") is None
 
     def test_insertion_order_of_parameters(self) -> None:
         # ord = tuple(F.parameters): el orden JSON es el del dict (insertion
@@ -605,7 +606,7 @@ class TestLevel1Oracle:
         schema = SchemaContext([fn])
         for t in ("{", '"name": ', '"', "fn_ordered", '"'):
             step(state, schema, t)
-        assert _next_static_text(state, schema, "") == ',\n  "parameters": {\n    "b": '
+        assert _get_next_static_text(state, schema, "") == ',\n  "parameters": {\n    "b": '
 
     def test_align_trims_emitted_ws(self) -> None:
         # E: si emitted ya termina en el ws del canónico (el modelo lo puso),
@@ -616,7 +617,7 @@ class TestLevel1Oracle:
         step(state, schema, ', "parameters": {')
         step(state, schema, '"name": ')
         step(state, schema, '"x"')  # único param (string): ρ=0 → VALUE_END d1
-        assert _next_static_text(state, schema, "\n  ") == "}\n}"
+        assert _get_next_static_text(state, schema, "\n  ") == "}\n}"
 
     def test_t2_aligns_fused_comma_indent(self) -> None:
         # El token fusionado '",\n  ' (coma + indent del modelo en UN token)
@@ -625,7 +626,7 @@ class TestLevel1Oracle:
         state, schema, _vocab, _trie = at_params("fn_add_numbers")
         step(state, schema, ",")  # IN_OBJECT d0 (el ',' no resetea la key)
         assert state.phase is DecoderPhase.IN_OBJECT and state.depth == 0
-        assert _next_static_text(state, schema, ",\n  ") == (
+        assert _get_next_static_text(state, schema, ",\n  ") == (
             '"parameters": {\n    "a": '
         )
 
@@ -635,7 +636,7 @@ class TestLevel1Oracle:
         # alineamiento imposible → None → forward normal (seguro, sin
         # forzar tramos — Riesgo 2 cubierto por diseño).
         state, schema, _vocab, _trie = at_params("fn_add_numbers")
-        assert _next_static_text(state, schema, "\n  ") is None
+        assert _get_next_static_text(state, schema, "\n  ") is None
 
 
 class TestOracleDomainDisjunction:
@@ -647,18 +648,18 @@ class TestOracleDomainDisjunction:
         # VALUE_END d0: T1 responde SOLO con N=1 (post-name, params por
         # abrir); T6 SOLO con N=0 ∧ ρ=0 ∧ P=1 (post-parameters).
         state, schema, _vocab, _trie = at_params("fn_add_numbers")
-        assert _next_static_text(state, schema, "") == T1_CANON_ADD
+        assert _get_next_static_text(state, schema, "") == T1_CANON_ADD
         state2, schema2, _v2, _t2 = set_params_ctx()
         step(state2, schema2, '"a": 2.0')
         step(state2, schema2, ', "b": 3')
         step(state2, schema2, "}")
-        assert _next_static_text(state2, schema2, "") == T6_CANON
+        assert _get_next_static_text(state2, schema2, "") == T6_CANON
 
     def test_t3_vs_t6_pending_keys_gate(self) -> None:
         # PARAMS_OBJECT d1 es T3 (ρ=1); con ρ=0 no matchea T3 → si el cierre
         # viene por el modelo, T6 lo complementa solo en d0.
         state, schema, _vocab, _trie = set_params_ctx()
-        assert _next_static_text(state, schema, "") == T3_CANON_FIRST
+        assert _get_next_static_text(state, schema, "") == T3_CANON_FIRST
 
 
 class TailFakeModel(FakeModel):

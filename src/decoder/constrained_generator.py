@@ -1,74 +1,76 @@
-"""Constrained generator (Task 4.1): el loop de generación.
+"""Constrained generation loop: the three paths of every decoding step.
 
-CÓMO LEER ESTE MÓDULO (lo primero que conviene entender):
-- generate() es el bucle. Todo lo demás son helpers, están más abajo en el
-  archivo en orden inverso de uso: primero lo que el bucle llama al final.
-- Cada step del bucle recorre TRES caminos, en este orden, y gana el primero
-  que aplica:
-    1. TRAMO ESTÁTICO (sin forward). Si el estado actual matchea un texto
-       determinista — el header Opt2 al arrancar, o el tail al cerrar — se
-       inyecta YA tokenizado. Es el camino más barato: no consulta al modelo.
-    2. M5 SKIP-IF-SINGLE (sin forward). Si no hay wildcard y el filtro
-       completo devuelve exactamente 1 candidato, no hay decisión que tomar:
-       se commitea sin gastar un forward.
-    3. M1/M2 CON FORWARD. Se consulta al modelo y se elige por argmax sobre
-       los candidatos válidos, con pase fino (Inciso 4.1.1, más abajo).
-- INVARIANTE ESTRUCTURAL: los 3 caminos terminan en UN commit cada uno, y
-  ese commit es la misma secuencia de 4 operaciones:
+HOW TO READ THIS MODULE (start here):
+- ``generate()`` is the loop. Everything else is a helper, placed below in
+  reverse call order: whatever the loop calls last comes first.
+- Each step walks THREE paths, in this order, first match wins:
+    1. STATIC TEXT (no forward). If the current state matches a
+       deterministic span — the static header at startup, or a closing
+       tail — it is injected already tokenized. Cheapest path: no model
+       query at all.
+    2. M5 SKIP-IF-SINGLE (no forward). If there is no wildcard and the
+       full filter returns exactly 1 candidate there is no decision to
+       make: commit it without paying a forward.
+    3. M1/M2 WITH FORWARD. Query the model and pick by argmax over the
+       valid candidates, with the fine pass (see below).
+- STRUCTURAL INVARIANT: all three paths end in ONE commit, and that commit
+  is the same 4-operation sequence:
       input_ids.append(id) → state.update_from_text(text) → schema.update(state)
       → emitted_parts.append(text)
-  Esa secuencia vive encapsulada en _commit_token(), no replicada inline. Si
-  se replicara por camino, un commit nuevo al que se le olvidara la fila de
-  emitted_parts haría que el pase fino y el tramo estático del oráculo
-  vieran un output incompleto — es exactamente lo que pasó en BUG-012.
+  The sequence lives encapsulated in ``_commit_token()``, never replicated
+  inline. Replicating it per path would let a new commit forget the
+  ``emitted_parts`` row, making the fine pass and the oracle's static span
+  see an incomplete output — silent breakage of the same class as the
+  whitespace-duplication failure documented below.
 
-POR QUÉ EXISTE ESTE MÓDULO (por dentro):
-- Es la cinta transportadora del plan didáctico: por cada step toma los
-  logits del modelo, los filtra a los ids que mantienen el output como JSON
-  válido (compute_allowed_ids), elige por argmax el mejor token permitido,
-  commitea el estado y repite hasta COMPLETE o el límite de tokens.
-- Es el ÚNICO consumidor de compute_allowed_ids: el filter (Task 3.4) reduce
-  los ~151K ids del vocab a un set pequeño; acá vive el argmax que la firma
-  del filter tenía reservado (el filter NO consume logits).
+WHY THIS MODULE EXISTS:
+- It is the conveyor belt of the didactic plan: per step it takes the
+  model's logits, filters them to the ids that keep the output valid JSON
+  (``compute_allowed_ids``), picks the best allowed token by argmax,
+  commits the state, and repeats until COMPLETE or the token limit.
+- It is the ONLY consumer of ``compute_allowed_ids``: the filter reduces
+  the ~151K vocab ids to a small set; the argmax its signature reserved
+  lives here (the filter itself does NOT consume logits).
 
-INCISO 4.1.1 — PASO FINO POST-ARGMAX (corrección documentada en el plan):
-- Los gaps de las cláusulas del schema (documentados en sus docstrings) son
-  abstención por no-coincidencia de bordes pre/post: el filter valida el
-  token como un TODO (snapshot commiteado + snapshot simulado), no el
-  recorrido char-por-char. Un token que entra Y sale de estructuras en un
-  solo step escapa a las cláusulas: name completo atravesado (cláusula 1),
-  entrada a parameters + primera key (cláusula 2 residual 2), key+value+
-  cierre completos (cláusula 3), entrada y salida de parameters (cláusula 4).
-- Acá se cierra con COSTE DESPRECIABLE: re-simular SOLO el token GANADOR
-  char-por-char con un SchemaContext FRESCO (no el compartido, que quedaría
-  contaminado si el candidato falla) y validar en CADA carácter. En el
-  recorrido por carácter las cláusulas gatillan donde el pase por token no
-  las gatillaba: el reset de current_key, el COLON intermedio, el depth 0→1→0.
-- Si el ganador no pasa el pase fino, se descarta y se prueba el SIGUIENTE
-  mejor de allowed (argmax repetido). Normalmente el primero pasa (~1
-  re-simulación por step); el peor caso es degradación controlada.
-  OJO — esto depende de qué rama del filter produjo `allowed` (ver
-  _pick_best_token): con M2 (top-k del modelo) hay hasta 2000 alternativas y
-  el reintento tiene dónde elegir; con M1 (el argmax crudo, fast path) `allowed`
-  trae un único elemento, así que si ese uno falla el pase fino no hay
-  alternativa y el veto aplica. Hoy el veto de M1 no se ha observado en la
-  suite, pero la rama sigue abierta por diseño (M1 existe para no validar
-  nada extra cuando la decisión ya está tomada).
-- Cierra además el gap del plan "output object sin parameters": cuando el
-  estado llega a COMPLETE, el pase fino exige que el recorrido haya pasado
-  por PARAMS_OBJECT (SchemaContext.has_seen_params_object). El subject V.4.1
-  SIEMPRE emite el objeto (aún vacío para fn_empty).
+FINE PASS — POST-ARGMAX RE-SIMULATION:
+- The schema clauses have documented gaps: the filter validates a token as
+  a WHOLE (committed snapshot + simulated snapshot), not its char-by-char
+  walk. A token that enters AND leaves structures in one step escapes the
+  clauses: full name crossed (clause 1), entry into parameters + first key
+  (clause 2 residual), key+value+closing complete (clause 3), entry and
+  exit of parameters (clause 4).
+- Closed here at NEGLIGIBLE cost: re-simulate ONLY the WINNING token
+  char-by-char against a FRESH SchemaContext (never the shared one, which
+  would stay contaminated if the candidate fails) and validate EVERY
+  character. Along the char walk the clauses fire where the per-token pass
+  did not: the current_key reset, the intermediate COLON, the depth
+  0→1→0 transitions.
+- If the winner fails the fine pass it is dropped and the NEXT best in
+  ``allowed`` is tried (repeated argmax). Normally the first one passes
+  (~1 re-simulation per step); the worst case is controlled degradation.
+  NOTE — the retry only has somewhere to go depending on which filter
+  branch produced `allowed` (see ``_pick_best_token``): with M2 (model
+  top-k) there are up to 2000 alternatives, so the retry can rescue the
+  generation; with M1 (raw argmax, fast path) `allowed` holds a single
+  element, so if that one fails there is no alternative and the veto
+  applies. The M1 veto has never been observed in the suite, but the
+  branch stays open by design (M1 exists to validate nothing extra when
+  the decision is already taken).
+- It also closes the "output object without parameters" gap: when the
+  state reaches COMPLETE, the fine pass requires the walk to have gone
+  through PARAMS_OBJECT (``SchemaContext.has_seen_params_object``). The
+  subject ALWAYS emits the object (even empty for fn_empty).
 
-DESVÍO DOCUMENTADO del pseudocódigo didáctico (L1745):
-- El commit usa vocab.id2decoded, NO vocab.id2token. Mismo desvío que el
-  filter (token_filter.py desvío 1): la state machine trabaja con el texto
-  DECODIFICADO ('Ġthe' → ' the'); id2token aportaría un token byte-mapheado
-  que rompería la validación sintáctica. El decode final para el output se
-  hace con model.decode() sobre los ids (el SDK aplica la tabla inversa).
+DOCUMENTED DEVIATION from the didactic pseudocode:
+- The commit uses ``vocab.id2decoded``, NOT ``vocab.id2token``. Same
+  deviation the filter documents: the state machine works over DECODED
+  text ('Ġthe' → ' the'); id2token would provide a byte-mapheaded token
+  that breaks syntax validation. The final decode for the output is done
+  with ``model.decode()`` over the ids (the SDK applies the inverse table).
 
-QUÉ NO HACE (separación de concerns):
-- No orquesta el pipeline completo (loaders, output file): eso vive en Task
-  4.2/4.3 + pipeline.py. Acá solo el bucle de generación pura.
+WHAT IT DOES NOT DO (separation of concerns):
+- No full-pipeline orchestration (loaders, output file): that lives in
+  pipeline.py. This module is only the pure generation loop.
 """
 
 from __future__ import annotations
@@ -87,66 +89,86 @@ from src.loader.vocab_loader import Vocab
 from src.models.function_definition import FunctionDef
 from src.utils.metrics import MetricsRun
 
-MAX_TOKENS = 200  # Safety net — el output esperado es ~30-60 tokens
+MAX_TOKENS = 200  # Safety net — expected output is ~30-60 tokens
 
-# Opt2 (Anexo de Latencia §2.2, CONTEXTO_REFACTOR.md): prefijo 100%
-# determinista por el schema — TODO output válido arranca con esta
-# estructura antes de que el LLM tenga que elegir el nombre real de la
-# función. Se tokeniza UNA vez con encode() y se inyecta sin forward ni
-# filtro (ver _commit_static_text): recorta los forwards estructurales
-# de ROOT/OBJECT_OPEN/KEY_START/IN_KEY/KEY_END/COLON medidos en el Anexo
-# (~8-11 por prompt, ~4.5-4.8s cada uno — el costo del forward() del
-# modelo es uniforme por step, no depende del tamaño del candidate set,
-# así que evitar el forward es la única palanca real acá).
-# ⚠ BUG-012 (2026-09-23): el header DEBE ser BYTE-EXACTO al formato natural
-# que el modelo produce solo (con las 2 newlines iniciales antes de '{',
-# como en el Anexo — la política compacta ya había fallado antes por lo
-# mismo, commit abortado 7bf38ed). Recortar esas newlines "porque total no
-# cuestan forward" (inyectar más texto no cuesta nada extra: TODO el header
-# se salta el modelo por igual) rompió P2 ('Greet shrek'): el modelo quedó
-# en un estado fuera de distribución y tokenizó el name como un "f" suelto
-# en vez de un chunk natural, dejando sin candidatos válidos el step
-# siguiente (ningún token entre los top-2000 por logit mantenía "f..." como
-# prefijo del trie). Con las newlines restauradas, P2 vuelve a completar.
+# 100% schema-deterministic prefix: EVERY valid output starts with this
+# structure before the LLM has to choose the real function name. It is
+# tokenized ONCE with encode() and injected with no forward and no filter
+# (see _commit_static_text): it cuts the structural forwards of
+# ROOT/OBJECT_OPEN/KEY_START/IN_KEY/KEY_END/COLON (~8-11 per prompt,
+# ~4.5-4.8s each — the forward() cost is uniform per step and does not
+# depend on the candidate-set size, so skipping the forward is the only
+# real lever here).
+# ⚠ The header MUST be BYTE-EXACT to the format the model naturally
+# produces (the two leading newlines before '{'). Trimming those newlines
+# "because they cost no forward" (injecting more text costs nothing extra:
+# the whole header skips the model equally) pushed the model out of
+# distribution: it tokenized the name as a lone "f" instead of a natural
+# chunk, leaving no valid candidate for the next step (no token among the
+# top-2000 by logit kept "f..." as a trie prefix). With the newlines
+# restored, that prompt completes again.
 STATIC_HEADER = '\n\n{\n  "name": "'
 
-# ─── Oráculo por estado — Fase 2 (Anexo §"Registro de decisiones 25/09") ──
-# Generaliza el 2º tramo lineal (que trajo BUG-013) a una tabla de tramos
-# por estado (NIVEL 1 del registro formal): cada tramo es una FUNCIÓN PURA
-# (state, schema, emitted) -> texto canónico alineado, o None (None = se
-# cae al camino normal: M5 → filtro → forward). El oráculo NUNCA fuerza:
-# solo responde cuando el tramo es la única continuación determinista del
-# schema (Riesgo 2 del 2º tramo cubierto POR DISEÑO).
+# ─── Per-state oracle (level-1 static spans) ─────────────────────────────
+# Generalizes the linear second span into a table of spans per state
+# (level 1 of the formal register): each span is a PURE function
+# (state, schema, generated_text) -> aligned expected text, or None (None =
+# fall through to the normal path: M5 → filter → forward). The oracle
+# NEVER forces: it only answers when the span is the only deterministic
+# continuation the schema allows — the design itself rules out forcing text
+# the model would never produce.
 #
-# Definiciones del registro (Anexo D1-D4, verificadas contra state.py):
-#   WS = " \t\n\r" · E = ws final de emitted (SOLO en fases ciegas al ws:
-#   VALUE_END/IN_OBJECT/PARAMS_OBJECT/KEY_END/COLON — en KEY_START/IN_KEY
-#   el espacio es contenido de la key y no se usa).
-#   N = depth==0 ∧ current_key=="name" ∧ keys_enclosed==∅  → gate del
-#   tramo de apertura de parameters. Reemplaza a ¬has_seen_params_object:
-#   ese flag es sticky y SOLO se enciende si el token termina en
-#   PARAMS_OBJECT (update() corre con el estado post-token) → un token BPE
-#   que cruza el '{' (ej. '{"') lo deja apagado con parameters ya abierto:
-#   falso negativo EN LA DIRECCIÓN INSEGURA (duplicaría el tramo). N, en
-#   cambio, es derivable por casos: BUG-013 (param interno "name" de
-#   fn_greet) deja keys_enclosed≠∅ → N=0; fn_empty (0 params) deja
-#   current_key=="parameters" → N=0; N=1 ⟺ entre el value de "name" y la
-#   key siguiente.
-#   ord = tuple(F.parameters)  (insertion order — test dedicado)
-#   ρ = (R != ∅) con R = schema.required_keys_remaining()
-#   K1 = ord[0] · Knext = primer k de ord con k∈R
-#   OP(k) = '"' si F.parameters[k].type=="string" sino ''  (comilla de
-#   apertura del value: los tramos dejan el estado en COLON o
-#   IN_STRING_VALUE d1 según el tipo)
-#   KEY(k) = '"' + k + '": ' + OP(k) · ENTRY(k) = '\n    ' + KEY(k)
-#   align(C) = C[len(E):] si C.startswith(E) sino None; '' → None.
-# Tramo GRATIS (dec. 25/09): con ord=∅, T1/T2 devuelven None → el modelo
-# genera "parameters": {} con su token FUSIONADO {} (tid 6257) — inyectar
-# '{' suelto sería una costura tipo BUG-012 sobre un formato que el modelo
-# nunca produce. Ninguna función del subject cae ahí (todas tienen params);
-# el caso fn_empty queda verificado por el probe real (formato INLINE).
-# Nivel 2 (T7-T10, tokens fusionados) y B′ (completar fn_name por trie):
-# DIFERIDOS hasta medir el residuo del Nivel 1 (Anexo D4/D7).
+# Glossary (each symbol, its practical meaning — verified against state.py):
+#   generated_text        Output text generated so far (fed per call by
+#                         generate(); the oracle aligns against it).
+#   expected_text         The ideal text the oracle wants to inject.
+#   trailing_whitespace   Trailing spaces/newlines of generated_text
+#                         (ws-blind phases ONLY: VALUE_END/IN_OBJECT/
+#                         PARAMS_OBJECT/KEY_END/COLON — in KEY_START/IN_KEY
+#                         a space is key content and is not consumed).
+#   is_between_name_and_parameters
+#                         depth==0 ∧ current_key=="name" ∧ keys_enclosed==∅
+#                         → gate for the parameters-opening span. Replaces
+#                         ¬has_seen_params_object: that flag is sticky and
+#                         only turns on if the token ENDS in PARAMS_OBJECT
+#                         (update() runs with the post-token state) → a BPE
+#                         token crossing the '{' (e.g. '{"') leaves it off
+#                         with parameters already open: a false negative in
+#                         the UNSAFE direction (it would duplicate the
+#                         span). The gate is case-derivable instead: an
+#                         internal param literally named "name" leaves
+#                         keys_enclosed≠∅ → false; fn_empty (0 params)
+#                         leaves current_key=="parameters" → false; true ⟺
+#                         between the value of "name" and the next key.
+#   parameter_order       tuple(F.parameters) — original insertion order.
+#   missing_required_parameters
+#                         Required parameter keys still missing
+#                         (schema.required_keys_remaining()).
+#   has_missing_required_parameters
+#                         Pending-params flag: missing_required_parameters
+#                         != ∅.
+#   first_parameter_name  parameter_order[0], first parameter key.
+#   next_required_parameter_name
+#                         First parameter key that is still required.
+#   opening_quote_for_value(k)
+#                         Opening quote for k's value, only if the param
+#                         type is "string" (spans leave the state in COLON
+#                         or IN_STRING_VALUE d1 depending on the type).
+#   parameter_key_text(k) Key text plus its two dots and value opener:
+#                         '"age": ' + opening_quote_for_value(k).
+#   indented_parameter_entry(k)
+#                         Newline, indentation and parameter_key_text(k) —
+#                         the model's natural per-key layout.
+#   align_static_text(C)  Strip already-emitted trailing_whitespace from
+#                         the expected text; None (and '' → None) when
+#                         alignment is impossible → span does not apply.
+# FREE SPAN: with an empty parameter_order, T1/T2 return None — the model
+# generates "parameters": {} with its FUSED {} token; injecting a lone '{'
+# would be a seam over a format the model never produces. No subject
+# function hits that path (all have params); fn_empty is covered by the
+# real probe (inline {} format).
+# Level 2 (T7-T10, fused tokens) and B′ (complete fn_name via trie):
+# DEFERRED until the level-1 residue is measured.
 _WS = " \t\n\r"
 _WS_BLIND_PHASES = frozenset(
     {
@@ -159,28 +181,33 @@ _WS_BLIND_PHASES = frozenset(
 )
 
 
-def _trailing_ws(text: str) -> str:
-    """E del registro: el whitespace FINAL de ``text`` ('' si no hay)."""
+def _get_trailing_whitespace(text: str) -> str:
+    """Return the trailing whitespace from ``text``."""
     return text[len(text.rstrip(_WS)):]
 
 
-def _align(canon: str, emitted: str, blind: bool) -> str | None:
-    """Alinea el canónico contra el ws ya emitido. '' → None (spec Anexo).
+def _align_static_text(
+    expected_text: str, generated_text: str, align_trailing_whitespace: bool
+) -> str | None:
+    """Align expected static text with already generated text.
 
-    Evita la duplicación de whitespace (la clase de BUG-012): si el modelo
-    ya emitió el ws del canónico (E), se corta y se inyecta solo el resto.
-    Si el canónico NO arranca con E, el alineamiento es imposible → None →
-    el tramo no aplica y la generación cae al forward (seguro).
+    If the model already generated the expected trailing whitespace, return
+    only the remaining text to avoid duplicating it. Return ``None`` when
+    the generated whitespace cannot align with the expected text.
     """
-    e = _trailing_ws(emitted) if blind else ""
-    if not canon.startswith(e):
+    trailing_whitespace = (
+        _get_trailing_whitespace(generated_text)
+        if align_trailing_whitespace
+        else ""
+    )
+    if not expected_text.startswith(trailing_whitespace):
         return None
-    rest = canon[len(e):]
-    return rest or None
+    remaining_text = expected_text[len(trailing_whitespace):]
+    return remaining_text or None
 
 
-def _gate_n(state: DecoderState) -> bool:
-    """N del registro: entre el value de 'name' y la key siguiente."""
+def _is_between_name_and_parameters(state: DecoderState) -> bool:
+    """Return whether the output is between ``name`` and ``parameters``."""
     return (
         state.depth == 0
         and state.current_key == "name"
@@ -188,8 +215,8 @@ def _gate_n(state: DecoderState) -> bool:
     )
 
 
-def _op(schema: SchemaContext, key: str) -> str:
-    """OP(k): comilla de apertura del value si el parámetro es string."""
+def _get_value_opening_quote(schema: SchemaContext, key: str) -> str:
+    """Return the value's opening quote when the parameter is a string."""
     f = schema.selected_function
     if f is None:
         return ""
@@ -197,72 +224,87 @@ def _op(schema: SchemaContext, key: str) -> str:
     return '"' if param is not None and param.type == "string" else ""
 
 
-def _key(schema: SchemaContext, key: str) -> str:
-    """KEY(k): '"' + k + '": ' + OP(k) — key más apertura de su value."""
-    return f'"{key}": ' + _op(schema, key)
+def _build_parameter_key_text(schema: SchemaContext, key: str) -> str:
+    """Build a parameter key and the opening quote of its value."""
+    return f'"{key}": ' + _get_value_opening_quote(schema, key)
 
 
-def _entry(schema: SchemaContext, key: str) -> str:
-    """ENTRY(k): '\n    ' + KEY(k) — formato natural de Qwen por key."""
-    return "\n    " + _key(schema, key)
+def _build_indented_parameter_entry(schema: SchemaContext, key: str) -> str:
+    """Build an indented parameter entry in the model's natural format."""
+    return "\n    " + _build_parameter_key_text(schema, key)
 
 
-def _knext(schema: SchemaContext) -> str:
-    """Knext: primer key de ord que sigue requerida (ρ=1 ya validado)."""
+def _get_next_required_parameter_name(schema: SchemaContext) -> str:
+    """Return the first required parameter name that has not been emitted."""
     f = schema.selected_function
     if f is None:
-        raise AssertionError("_knext() sin función seleccionada")
-    remaining = schema.required_keys_remaining()
-    for k in tuple(f.parameters):
-        if k in remaining:
-            return k
-    raise AssertionError("_knext() sin keys pendientes (ρ=1 violado)")
+        raise AssertionError(
+            "_get_next_required_parameter_name() without selected function"
+        )
+    missing_required_parameters = schema.required_keys_remaining()
+    for parameter_name in tuple(f.parameters):
+        if parameter_name in missing_required_parameters:
+            return parameter_name
+    raise AssertionError(
+        "_get_next_required_parameter_name() without missing parameters"
+    )
 
 
-def _tramp_t1(
-    state: DecoderState, schema: SchemaContext, emitted: str
+def _inject_parameters_after_name_value(
+    state: DecoderState, schema: SchemaContext, generated_text: str
 ) -> str | None:
-    """T1: VALUE_END, d0, N=1 → la coma + apertura de parameters + 1ra key."""
-    if not (state.phase is DecoderPhase.VALUE_END and _gate_n(state)):
-        return None
-    f = schema.selected_function
-    if f is None:
-        return None
-    ord_ = tuple(f.parameters)
-    if not ord_:
-        return None  # ord=∅ → forward (token {} fusionado del modelo)
-    canon = ",\n  \"parameters\": {" + _entry(schema, ord_[0])
-    return _align(canon, emitted, True)
-
-
-def _tramp_t2(
-    state: DecoderState, schema: SchemaContext, emitted: str
-) -> str | None:
-    """T2: IN_OBJECT, d0, N=1 → apertura + 1ra key (token fusionado '",')."""
-    if not (state.phase is DecoderPhase.IN_OBJECT and _gate_n(state)):
+    """T1: close ``name``, then inject ``parameters`` and its first key."""
+    if not (
+        state.phase is DecoderPhase.VALUE_END
+        and _is_between_name_and_parameters(state)
+    ):
         return None
     f = schema.selected_function
     if f is None:
         return None
-    ord_ = tuple(f.parameters)
-    if not ord_:
-        return None
-    canon = "\n  \"parameters\": {" + _entry(schema, ord_[0])
-    return _align(canon, emitted, True)
+    parameter_order = tuple(f.parameters)
+    if not parameter_order:
+        return None  # no params → forward (model's fused {} token)
+    expected_text = ",\n  \"parameters\": {" + _build_indented_parameter_entry(
+        schema, parameter_order[0]
+    )
+    return _align_static_text(expected_text, generated_text, True)
 
 
-def _tramp_t3(
-    state: DecoderState, schema: SchemaContext, emitted: str
+def _inject_parameters_after_name_separator(
+    state: DecoderState, schema: SchemaContext, generated_text: str
 ) -> str | None:
-    """T3: PARAMS_OBJECT, d1, ρ=1 → la primera key requerida que falta.
+    """T2: after the fused comma, inject ``parameters`` and its first key."""
+    if not (
+        state.phase is DecoderPhase.IN_OBJECT
+        and _is_between_name_and_parameters(state)
+    ):
+        return None
+    f = schema.selected_function
+    if f is None:
+        return None
+    parameter_order = tuple(f.parameters)
+    if not parameter_order:
+        return None
+    expected_text = "\n  \"parameters\": {" + _build_indented_parameter_entry(
+        schema, parameter_order[0]
+    )
+    return _align_static_text(expected_text, generated_text, True)
 
-    PARAMS_OBJECT es la fase "entre values" de este decoder (verificado:
-    VALUE_END + ',' → PARAMS_OBJECT, NO IN_OBJECT). Por eso T3 cubre DOS
-    entradas: (a) el '{' de apertura llegó por forward sin key fusionada, y
-    (b) la coma que cierra el value ANTERIOR — el caso número: IN_NUMBER_VALUE
-    (número abierto, sin VALUE_END) → la coma del modelo cierra el número y
-    deja PARAMS_OBJECT directamente. El alineamiento E absorbe el ws que el
-    modelo haya emitido tras la coma ('2.0,' + '\n    ' → e='\n    ').
+
+def _inject_next_required_parameter(
+    state: DecoderState, schema: SchemaContext, generated_text: str
+) -> str | None:
+    """T3: inside ``parameters``, inject the next required parameter key.
+
+    PARAMS_OBJECT is this decoder's "between values" phase (verified:
+    VALUE_END + ',' → PARAMS_OBJECT, NOT IN_OBJECT). So T3 covers TWO
+    entries: (a) the opening '{' arrived by forward with no fused key, and
+    (b) the comma closing the PREVIOUS value — the number case:
+    IN_NUMBER_VALUE (number open, no VALUE_END) → the model's comma closes
+    the number and lands directly in PARAMS_OBJECT. The trailing-whitespace
+    alignment absorbs whatever ws the model emitted after the comma
+    ('2.0,' + '\n    ' → trailing_whitespace='\n    ').
     """
     if not (state.phase is DecoderPhase.PARAMS_OBJECT and state.depth == 1):
         return None
@@ -270,18 +312,24 @@ def _tramp_t3(
         return None
     if not schema.required_keys_remaining():
         return None
-    return _align(_entry(schema, _knext(schema)), emitted, True)
+    return _align_static_text(
+        _build_indented_parameter_entry(
+            schema, _get_next_required_parameter_name(schema)
+        ),
+        generated_text,
+        True,
+    )
 
 
-def _tramp_t4(
-    state: DecoderState, schema: SchemaContext, emitted: str
+def _inject_next_parameter_after_value(
+    state: DecoderState, schema: SchemaContext, generated_text: str
 ) -> str | None:
-    """T4: VALUE_END, d1, ρ=1 → coma + próxima key requerida.
+    """T4: after a parameter value, inject the next required parameter key.
 
-    Solo se alcanza con un value que CIERRA en su propio token (strings,
-    y tokens que terminan en cierre): los números/booleans/nulls quedan
-    ABIERTOS (IN_NUMBER/BOOL/NULL_VALUE) hasta el siguiente carácter →
-    ese flujo retoma en T3 (la coma del modelo deja PARAMS_OBJECT).
+    Only reachable with a value that CLOSES in its own token (strings, and
+    tokens ending with a closer): numbers/booleans/nulls stay OPEN
+    (IN_NUMBER/BOOL/NULL_VALUE) until the next character → that flow
+    resumes in T3 (the model's comma leaves PARAMS_OBJECT).
     """
     if not (state.phase is DecoderPhase.VALUE_END and state.depth == 1):
         return None
@@ -289,79 +337,77 @@ def _tramp_t4(
         return None
     if not schema.required_keys_remaining():
         return None
-    canon = ",\n    " + _key(schema, _knext(schema))
-    return _align(canon, emitted, True)
+    expected_text = ",\n    " + _build_parameter_key_text(
+        schema, _get_next_required_parameter_name(schema)
+    )
+    return _align_static_text(expected_text, generated_text, True)
 
 
-def _tramp_t5(
-    state: DecoderState, schema: SchemaContext, emitted: str
+def _close_parameters_and_root(
+    state: DecoderState, schema: SchemaContext, generated_text: str
 ) -> str | None:
-    """T5: VALUE_END, d1, ρ=0 → cierre de parameters + cierre del ROOT."""
+    """T5: with no required parameters left, close ``parameters`` and root."""
     if not (state.phase is DecoderPhase.VALUE_END and state.depth == 1):
         return None
     if schema.selected_function is None:
         return None
     if schema.required_keys_remaining():
         return None
-    return _align("\n  }\n}", emitted, True)
+    return _align_static_text("\n  }\n}", generated_text, True)
 
 
-def _tramp_t6(
-    state: DecoderState, schema: SchemaContext, emitted: str
+def _close_root_object(
+    state: DecoderState, schema: SchemaContext, generated_text: str
 ) -> str | None:
-    """T6: VALUE_END, d0, N=0, ρ=0 → cierre del ROOT (fn_empty incl.).
+    """T6: after ``parameters``, close the root object (including fn_empty).
 
-    NOTA — P NO se exige (corrección al contrato, probe 25/09): el token
-    FUSIONADO del modelo '"parameters": {}' trae '{'+'}' en un solo
-    tocho y el flag sticky del schema (update POST-token) NUNCA ve el
-    PARAMS_OBJECT intermedio → has_seen_params_object() queda False en el
-    caso real de fn_empty. El gate N=0 ∧ ρ=0 ya garantiza post-parameters:
-    el ÚNICO VALUE_END d0 sin parameters abiertos es el post-name
-    (current_key=="name" → N=1, bloqueado arriba); una vez N=0 ∧ ρ=0, el
-    ROOT solo puede cerrarse.
+    The sticky schema flag does NOT need to have observed ``parameters``:
+    the model's fused token '"parameters": {}' carries '{'+'}' in one
+    chunk, so the sticky schema flag (update runs POST-token) NEVER sees
+    the intermediate PARAMS_OBJECT → has_seen_params_object() stays False
+    in the real fn_empty case. Being outside the name-to-parameters
+    transition with no pending required parameters already guarantees we
+    are after parameters: the only depth-0 VALUE_END before parameters is
+    the post-name state, blocked above. Therefore the only thing that can
+    close here is the root object.
     """
     if not (state.phase is DecoderPhase.VALUE_END and state.depth == 0):
         return None
-    if _gate_n(state):
-        return None  # N=0: dominios disjuntos con T1/T2
+    if _is_between_name_and_parameters(state):
+        return None  # T1/T2 own the name-to-parameters transition.
     if schema.selected_function is None:
         return None
     if schema.required_keys_remaining():
         return None
-    return _align("\n}", emitted, True)
+    return _align_static_text("\n}", generated_text, True)
 
 
-_TRAMPS: tuple[
+_STATIC_TEXT_RULES: tuple[
     Callable[[DecoderState, SchemaContext, str], str | None], ...
 ] = (
-    _tramp_t1,
-    _tramp_t2,
-    _tramp_t3,
-    _tramp_t4,
-    _tramp_t5,
-    _tramp_t6,
+    _inject_parameters_after_name_value,
+    _inject_parameters_after_name_separator,
+    _inject_next_required_parameter,
+    _inject_next_parameter_after_value,
+    _close_parameters_and_root,
+    _close_root_object,
 )
 
 
-def _next_static_text(
-    state: DecoderState, schema: SchemaContext, emitted: str
+def _get_next_static_text(
+    state: DecoderState, schema: SchemaContext, generated_text: str
 ) -> str | None:
-    """Devuelve el texto a inyectar para ``state``, o None (camino normal).
+    """Return the next deterministic text for ``state``, or ``None``.
 
-    CÓMO FUNCIONA (oráculo por estado, Nivel 1):
-    - Recorre _TRAMPS en orden y devuelve el texto del PRIMER tramo cuyo
-      dominio matchea el estado. Los dominios son disjuntos por
-      construcción (phase × depth × gates), así que el orden es de
-      claridad, no de precedencia.
-    - ``emitted`` es el texto del output generado hasta el momento (sin el
-      prompt): alimenta E para el alineamiento anti-duplicación (BUG-012).
-    - Pureza: no muta ni state ni schema, es determinista y no consulta el
-      modelo (contrato del diseño consultado).
+    The rules are checked in T1-T6 order. Their domains are disjoint by
+    construction, so the order documents the design rather than precedence.
+    The function is pure: it does not mutate ``state`` or ``schema`` and
+    does not query the model.
     """
-    for tramp in _TRAMPS:
-        text = tramp(state, schema, emitted)
-        if text is not None:
-            return text
+    for static_text_rule in _STATIC_TEXT_RULES:
+        expected_text = static_text_rule(state, schema, generated_text)
+        if expected_text is not None:
+            return expected_text
     return None
 
 
@@ -374,42 +420,42 @@ def generate(
     max_tokens: int = MAX_TOKENS,
     metrics: MetricsRun | None = None,
 ) -> tuple[str, bool]:
-    """Genera output JSON constrained para un prompt.
+    """Generate schema-constrained JSON output for a prompt.
 
     Args:
-        model: Modelo del SDK (encode/get_logits_from_input_ids/decode).
-        prompt: Texto del prompt a responder con un function call.
-        vocab: Vocabulario pre-indexado (id2token + id2decoded + buckets).
-        functions: Definiciones de función del schema.
-        trie: Trie de nombres de función (build_trie(functions)).
-        max_tokens: Límite de seguridad del bucle.
-        metrics: Acumulador opcional de métricas por fase; si se provee,
-            registra forwards, skips-if-single y tiempo por DecoderPhase.
+        model: SDK model (encode/get_logits_from_input_ids/decode).
+        prompt: Prompt text to answer with a function call.
+        vocab: Pre-indexed vocabulary (id2token + id2decoded + buckets).
+        functions: Schema function definitions.
+        trie: Function-name trie (build_trie(functions)).
+        max_tokens: Safety limit for the loop.
+        metrics: Optional per-phase metrics accumulator; when provided it
+            records forwards, skips-if-single and time per DecoderPhase.
 
     Returns:
-        (texto_generado, éxito): éxito True si el estado llegó a COMPLETE.
+        (generated_text, success): success is True iff the state reached
+        COMPLETE.
 
-    CÓMO FUNCIONA (por dentro):
-    - Mismo esqueleto que el pseudocódigo del plan (PLAN_DIDACTICO L1696):
-      tokenizar prompt → estado/schema iniciales → por step: logits →
-      compute_allowed_ids → argmax → append → commit → COMPLETE?.
-    - El pase fino del Inciso 4.1.1 vive en el argmax: _pick_best_token()
-      descarta los candidatos que no pasan _passes_fine_validation().
+    HOW IT WORKS:
+    - Same skeleton as the plan's pseudocode: tokenize prompt → initial
+      state/schema → per step: logits → compute_allowed_ids → argmax →
+      append → commit → COMPLETE?.
+    - The fine pass lives inside the argmax: ``_pick_best_token()`` drops
+      candidates that fail ``_passes_fine_validation()``.
     """
-    # ⚠ BUG-005 (2026-09-18): el SDK devuelve un tensor 2D [1, N]; [0].tolist()
-    # lo aplana a list[int] — el contrato que espera get_logits_from_input_ids.
+    # ⚠ The SDK returns a 2D tensor [1, N]; [0].tolist() flattens it to
+    # list[int] — the contract get_logits_from_input_ids expects.
     input_ids = model.encode(prompt)[0].tolist()
-    # Longitud del prompt ANTES del loop: input_ids después solo crece con los
-    # best_id generados, así el slice final separa prompt de generados sin
-    # re-encodear (antes se re-encodeaba y len() contaba FILAS del tensor 2D).
+    # Prompt length BEFORE the loop: input_ids afterwards only grows with
+    # generated best_ids, so the final slice separates prompt from
+    # generated without re-encoding (re-encoding used to count tensor ROWS).
     prompt_length = len(input_ids)
     state = DecoderState()
     schema = SchemaContext(functions)
-    # emitted: el texto GENERADO del output (sin el prompt), acumulado por
-    # iteración (dec. 25/09). Alimenta E (ws final) en el oráculo para el
-    # alineamiento anti-duplicación; se actualiza en CADA punto de commit
-    # (header, oráculo, M5 y forward) — nunca se resetea ni se deriva de
-    # estructuras aparte.
+    # generated output text (without the prompt), accumulated per iteration.
+    # Feeds the oracle's trailing-whitespace alignment; it is updated at
+    # EVERY commit point (header, oracle, M5, forward) — never reset nor
+    # derived from other structures.
     emitted_parts: list[str] = []
     _commit_static_text(
         STATIC_HEADER, model, vocab, input_ids, state, schema, emitted_parts
@@ -419,13 +465,13 @@ def generate(
         step_phase = state.phase
         step_start = perf_counter()
         try:
-            # ─── Oráculo por estado (Fase 2): tramos estáticos Nivel 1 ───
-            # ANTES del filter y del forward: si el estado matchea un tramo
-            # determinista (_TRAMPS), inyectarlo pre-tokenizado. Si la
-            # inyección no avanza el estado, se cae al camino normal — el
-            # continue SOLO ocurre con avance real (sin eso, re-matchear el
-            # mismo tramo en el step siguiente sería un loop infinito).
-            tail = _next_static_text(state, schema, "".join(emitted_parts))
+            # ─── Per-state oracle: level-1 static spans ───
+            # BEFORE the filter and the forward: if the state matches a
+            # deterministic span (_STATIC_TEXT_RULES), inject it pre-tokenized.
+            # If the injection does not advance the state, fall through to
+            # the normal path — the continue ONLY happens on real advance
+            # (otherwise re-matching the same span next step would loop).
+            tail = _get_next_static_text(state, schema, "".join(emitted_parts))
             if tail is not None and _commit_static_text(
                 tail, model, vocab, input_ids, state, schema, emitted_parts
             ):
@@ -433,7 +479,7 @@ def generate(
                     break
                 continue
 
-            # ─── M5: Skip-if-single (Anexo de Latencia) ───
+            # ─── M5: Skip-if-single ───
             # Check first WITHOUT model call. In non-wildcard phases, the
             # candidate set is small (~10-100 tokens) so the full filter is
             # fast. If exactly 1 candidate exists, we can skip the forward
@@ -470,30 +516,31 @@ def generate(
             allowed = compute_allowed_ids(state, schema, vocab, trie, logits)
 
             if not allowed:
-                # Empty set handling: el plan dice "attempt repair or break".
-                # MVP: break — el output queda truncado y success=False.
+                # Empty set handling: the plan says "attempt repair or
+                # break". MVP: break — output stays truncated, success=False.
                 break
 
-            # Argmax sobre allowed + pase fino (Inciso 4.1.1): descarta el
-            # mejor candidato si no supera la re-simulación char-por-char.
+            # Argmax over allowed + fine pass: drop the best candidate if
+            # it fails the char-by-char re-simulation.
             best_id, token_text = _pick_best_token(
                 allowed, logits, state, schema, functions, vocab, trie
             )
             if best_id is None:
-                # Ningún candidato de allowed pasó el pase fino.
+                # No candidate in allowed passed the fine pass.
                 break
 
-            # Un "number" que cierra como entero ('2,') se completa a '2.0'
-            # ANTES de commitear el cierre elegido (sin forward extra).
+            # A "number" closing as an integer ('2,') completes to '2.0'
+            # BEFORE committing the chosen closer (no extra forward).
             _inject_float_tail(
                 state, schema, token_text, model, vocab, input_ids, emitted_parts
             )
 
-            # ⚠ DESVÍO del plan (ver docstring del módulo): se commitea con
-            # el texto DECODIFICADO, el mismo que vio la state machine en
-            # simulate(). Las 4 operaciones van juntas en _commit_token: si
-            # update_from_text fallara (no debería, el filter ya validó este
-            # token en Fase 2) el loop corta y el estado queda atómico.
+            # ⚠ Documented deviation (see module docstring): commit with
+            # DECODED text — the same text the state machine saw. The 4
+            # operations travel together in _commit_token: if
+            # update_from_text failed (it should not: the filter already
+            # validated this token) the loop breaks and the state stays
+            # atomic.
             if not _commit_token(
                 best_id, token_text, state, schema, input_ids, emitted_parts
             ):
@@ -502,16 +549,16 @@ def generate(
             if state.phase is DecoderPhase.COMPLETE:
                 break
         finally:
-            # El timing del step se acumula en la fase en la que ARRANCÓ
-            # (step_phase); correr SIGUE el contrato con continue/break.
+            # Step timing accrues in the phase it STARTED in (step_phase);
+            # running on still honors the continue/break contract.
             if metrics is not None:
                 metrics.add_elapsed(
                     step_phase, (perf_counter() - step_start) * 1000.0
                 )
 
-    # Solo los tokens GENERADOS (no el prompt): prompt_length se calculó antes
-    # del loop sobre los ids reales del prompt (BUG-005). Sin el [0].tolist(),
-    # len() contaría las FILAS del tensor 2D y el slice arrastraría tokens.
+    # Only GENERATED tokens (not the prompt): prompt_length was computed
+    # before the loop over the real prompt ids. Without [0].tolist(), len()
+    # would count tensor ROWS and the slice would drag tokens along.
     generated_ids = input_ids[prompt_length:]
     generated = model.decode(generated_ids)
 
@@ -526,28 +573,29 @@ def _commit_token(
     input_ids: list[int],
     emitted_parts: list[str],
 ) -> bool:
-    """Commitea UN token generado: las 4 operaciones, siempre juntas.
+    """Commit ONE generated token: the 4 operations, always together.
 
-    POR QUÉ EXISTE (por dentro):
-    - El bucle tiene 2 caminos que committean un token elegido por el filtro
-      (M5 skip-if-single y M1/M2). Los dos necesitan SIEMPRE la misma
-      secuencia: sumar el id, avanzar la state machine, sincronizar el schema
-      con el estado nuevo, y recién ahí acumular el texto en emitted_parts.
-    - emitted_parts es lo que usan el pase fino (Inciso 4.1.1) y el tramo
-      estático del oráculo para ver el output ya emitido. Si un camino se
-      olvidara de la última fila, ambos verían un output incompleto y el
-      resultado se rompería de forma silenciosa (fue BUG-012). Por eso la
-      secuencia vive acá, en un solo lugar, y no replicada en cada commit.
-    - ORDEN INVARIABLE: el id se suma a input_ids ANTES de avanzar la state.
-      Si update_from_text rechazara el texto (no debería: el filter ya lo
-      validó), el caller corta el loop. Ojo: en ese caso input_ids ya quedó
-      con el id adelantado mientras state y emitted_parts no — el "estado
-      atómico" del que hablan los comentarios se refiere a state/schema, no a
-      input_ids. Es una rama defensiva, no el camino normal.
+    WHY IT EXISTS:
+    - The loop has 2 paths committing a filter-chosen token (M5
+      skip-if-single and M1/M2). Both must ALWAYS run the same sequence:
+      append the id, advance the state machine, sync the schema to the new
+      state, and only then accumulate the text in emitted_parts.
+    - emitted_parts is what the fine pass and the oracle's static span use
+      to see the output emitted so far. A path forgetting the last row
+      would make both see an incomplete output and break silently — that is
+      exactly what happened in the whitespace-duplication failure. So the
+      sequence lives here, in one place, not replicated per path.
+    - INVARIANT ORDER: the id is appended to input_ids BEFORE advancing the
+      state. If update_from_text rejects the text (it should not: the
+      filter already validated this token) the caller breaks the loop.
+      Note: in that case input_ids already holds the id while state and
+      emitted_parts do not — "atomic state" in these comments refers to
+      state/schema, not input_ids. It is a defensive branch, not the
+      normal path.
 
     Returns:
-        True si el token quedó commiteado; False si update_from_text lo
-        rechazó (el caller debe cortar el loop).
+        True if the token was committed; False if update_from_text rejected
+        it (the caller must break the loop).
     """
     input_ids.append(token_id)
     if not state.update_from_text(token_text):
@@ -569,18 +617,18 @@ def _inject_float_tail(
     input_ids: list[int],
     emitted_parts: list[str],
 ) -> bool:
-    """Completa a float un "number" que el modelo está por cerrar como entero.
+    """Complete a "number" the model is about to close as an integer.
 
-    ⚠ POR QUÉ ES UN HELPER Y NO UN if EN EL LOOP: el decoder tiene DOS paths
-    de commit — el ambiguo (argmax sobre `allowed`) y el M5 skip-if-single
-    (`len(allowed) == 1`). Ambos pueden commitear el token de cierre, así que
-    si la regla viviera en uno solo, el invariante "un 'number' siempre cierra
-    como float" dependería del path por el que pasó el token. Con
-    `state.expected_first_chars()` en IN_NUMBER_VALUE no hay comodín '*'
-    (`_number_next_chars` devuelve chars literales), así que el guard del M5
-    SÍ se cumple ahí: el hueco es alcanzable, no teórico.
+    ⚠ WHY A HELPER AND NOT AN if IN THE LOOP: the decoder has TWO commit
+    paths — the ambiguous one (argmax over `allowed`) and M5 skip-if-single
+    (`len(allowed) == 1`). Both can commit the closing token, so if the
+    rule lived in only one of them, the invariant "a 'number' always closes
+    as a float" would depend on which path the token took. In
+    IN_NUMBER_VALUE, `state.expected_first_chars()` has no wildcard '*'
+    (`_number_next_chars` returns literal chars), so the M5 guard DOES hold
+    there: the gap is reachable, not theoretical.
 
-    Returns True si inyectó (el estado avanzó); False si no aplicaba.
+    Returns True if injected (state advanced); False if it did not apply.
     """
     tail = _float_tail(state, schema, token_text)
     if tail is None:
@@ -593,13 +641,14 @@ def _inject_float_tail(
 def _float_tail(
     state: DecoderState, schema: SchemaContext, token_text: str
 ) -> str | None:
-    """'.0' si ``token_text`` cierra un literal entero de un parámetro "number".
+    """'.0' if ``token_text`` closes an integer literal of a "number" param.
 
-    La moulinette exige `isinstance(a, float)` para "number": `2` da 0
-    puntos, `2.0` pasa. Solo dispara cuando el modelo YA eligió cerrar (el
-    token arranca con terminador) y el buffer es un entero puro (sin '.' ni
-    exponente), así que un `2.5` o `0.0375` nunca se toca y el valor numérico
-    no cambia. Un "integer" no entra: su expected type es "integer".
+    The grader requires `isinstance(a, float)` for "number": `2` scores 0
+    points, `2.0` passes. It only fires when the model ALREADY chose to
+    close (the token starts with a closer) and the buffer is a pure integer
+    (no '.' or exponent), so a `2.5` or `0.0375` is never touched and the
+    numeric value does not change. An "integer" param never enters: its
+    expected type is "integer".
     """
     if state.phase is not DecoderPhase.IN_NUMBER_VALUE or state.depth != 1:
         return None
@@ -613,7 +662,7 @@ def _float_tail(
 
 
 def _commit_static_text(
-    text: str,
+    static_text: str,
     model: Small_LLM_Model,
     vocab: Vocab,
     input_ids: list[int],
@@ -621,40 +670,42 @@ def _commit_static_text(
     schema: SchemaContext,
     emitted_parts: list[str] | None = None,
 ) -> bool:
-    """Commitea texto estático ya tokenizado, sin llamar al modelo.
+    """Commit pre-tokenized static text without calling the model.
 
-    Despite el nombre viejo ("inject_static_header"), esto NO es solo el
-    header: es el ÚNICO punto de commit del camino estático, y por él pasan
-    tres textos distintos — el header Opt2 al arrancar, el tail de cierre al
-    terminar, y el sufijo float que _inject_float_tail le delega. Se llama
-    _commit_static_text porque lo que hace no es "inyectar un header" sino
-    "commitear una decisión del oráculo que no necesita consultar al modelo".
+    Despite the old name ("inject_static_header"), this is NOT only the
+    header: it is the SINGLE commit point of the static path, and three
+    distinct texts flow through it — the static header at startup, the
+    closing tail at the end, and the float suffix _inject_float_tail
+    delegates. It is called _commit_static_text because what it does is not
+    "inject a header" but "commit an oracle decision that needs no model
+    query".
 
-    CÓMO FUNCIONA (por dentro):
-    - `model.encode(text)` tokeniza el prefijo UNA vez; cada id resultante
-      se commitea con el mismo `state.update_from_text` del loop principal
-      (mismo contrato: atómico, mueve la state machine char por char).
-    - `emitted_parts` (opcional): cuando se pasa, cada decoded commitado se
-      acumula en él. El oráculo lo usa para computar E (ws final emitido) y
-      alinear sus canónicos — sin esto, `_next_static_text` no podría saber
-      qué ws ya salió por forward y duplicaría whitespace (clase BUG-012).
-    - Best-effort defensivo: el texto es JSON válido por construcción
-      (mismo grammar que valida `state.py`), así que no debería fallar. Si
-      algún id no decodifica o `update_from_text` rechaza el texto (p.ej.
-      un split de tokenizer inesperado), se corta la inyección ahí mismo —
-      el estado queda atómico (sin ese id) y el loop principal retoma
-      generando ese tramo por forward normal, sin crashear.
+    HOW IT WORKS:
+    - `model.encode(static_text)` tokenizes the prefix ONCE; each resulting
+      id is committed with the same `state.update_from_text` as the main
+      loop (same contract: atomic, advances the state machine char by char).
+    - `emitted_parts` (optional): when passed, each committed decoded text
+      accumulates there. The oracle uses it to compute the trailing
+      whitespace already emitted and align its expected texts — without it,
+      `_get_next_static_text` could not know which ws already came by
+      forward and would duplicate whitespace.
+    - Defensive best-effort: the text is valid JSON by construction (same
+      grammar `state.py` validates), so it should not fail. If some id does
+      not decode or `update_from_text` rejects the text (e.g. an unexpected
+      tokenizer split), the injection stops right there — the state stays
+      atomic (without that id) and the main loop resumes generating that
+      span by normal forward, without crashing.
 
     Returns:
-        True si se inyectó AL MENOS UN id (el estado avanzó); False si el
-        texto no aportó ids o todos fueron rechazados. El caller de los
-        tramos del oráculo DEBE consultar esto antes de `continue`: si no
-        avanza y se continúa, el step siguiente ve el MISMO estado →
-        matchea el mismo trigger → inyección fallida otra vez → loop
-        infinito. (El header 1 pre-loop ignora el retorno: se llama una
-        sola vez, fuera del loop — no tiene ese riesgo.)
+        True if AT LEAST ONE id was injected (state advanced); False if the
+        text contributed no ids or all were rejected. The caller of an
+        oracle span MUST check this before `continue`: if it does not
+        advance and you continue, the next step sees the SAME state →
+        matches the same trigger → failed injection again → infinite loop.
+        (The pre-loop header ignores the return: it is called once, outside
+        the loop — no such risk.)
     """
-    static_ids = model.encode(text)[0].tolist()
+    static_ids = model.encode(static_text)[0].tolist()
     advanced = False
     for token_id in static_ids:
         decoded = vocab.id2decoded.get(token_id)
@@ -677,34 +728,37 @@ def _pick_best_token(
     vocab: Vocab,
     trie: TrieNode,
 ) -> tuple[int | None, str]:
-    """Argmax restringido a `allowed`, con pase fino y reintento (4.1.1).
+    """Restricted argmax over `allowed`, with fine pass and retry.
 
-    QUÉ HACE (por dentro):
-    - Elige el token de `allowed` con el logit más alto (argmax restringido:
-      el mejor token que el modelo prefiere DENTRO de lo permitido). Si pasa
-      el pase fino, lo devuelve.
-    - Si NO pasa, lo saca del set y repite con el siguiente mejor. El bucle
-      termina de dos formas: encontramos un token que pasa el pase fino, o
-      se agotó `allowed` y no hay candidatos válidos → devuelve (None, "").
+    WHAT IT DOES:
+    - Picks the token in `allowed` with the highest logit (restricted
+      argmax: the best token the model prefers WITHIN what is allowed). If
+      it passes the fine pass, return it.
+    - If it does NOT, drop it from the set and repeat with the next best.
+      The loop ends two ways: we find a token that passes the fine pass, or
+      `allowed` runs out → returns (None, "").
 
-    LA TRAMPA — el reintento sólo tiene adónde ir si `allowed` traía más de
-    un elemento, y eso depende de qué rama del filter produjo el set:
-    - M2 (top-k del modelo): hasta 2000 candidatos → el reintento tiene
-      alternativas de verdad y puede rescatar la generación.
-    - M1 (el argmax crudo, fast path): 1 solo candidato → si ese falla el pase
-      fino, el bucle agota el set en una vuelta y devuelve el veto. No es un
-      bug: es que M1 existe para no validar nada cuando la decisión ya está
-      tomada, y su costo es que no deja plan B. Por eso el filtro acumula
-      (no corta) en M2, y por eso la asimetría es deliberada.
+    THE CATCH — the retry only has somewhere to go when `allowed` held more
+    than one element, and that depends on which filter branch produced the
+    set:
+    - M2 (model top-k): up to 2000 candidates → the retry has real
+      alternatives and can rescue the generation.
+    - M1 (raw argmax, fast path): a single candidate → if that one fails
+      the fine pass the loop exhausts the set in one round and returns the
+      veto. Not a bug: M1 exists to skip validation when the decision is
+      already taken, and its cost is having no plan B. That is why the
+      filter accumulates (does not cut) in M2, and why the asymmetry is
+      deliberate.
 
-    INVARIANTE que hace seguro el bucle: _passes_fine_validation() NO muta
-    ni `state` ni `schema` — copia el estado y valida sobre un SchemaContext
-    fresco. Si los contaminara, el primer candidato fallido dejaría el
-    contexto corrupto y los siguientes intentos validarían sobre basura.
+    INVARIANT that makes the loop safe: _passes_fine_validation() mutates
+    NEITHER `state` NOR `schema` — it copies the state and validates on a
+    fresh SchemaContext. If it contaminated them, the first failed
+    candidate would leave a corrupt context and later attempts would
+    validate against garbage.
 
-    EFECTO SECUNDARIO: este bucle consume `allowed` (lo va descartando). Quien
-    lo llama no debe volver a usar ese set después — si lo necesita intacto,
-    que pase una copia.
+    SIDE EFFECT: this loop consumes `allowed` (discarding as it goes). The
+    caller must not reuse that set afterwards — pass a copy if it needs it
+    intact.
     """
     while allowed:
         best_id = max(allowed, key=logits.__getitem__)
@@ -724,51 +778,53 @@ def _passes_fine_validation(
     trie: TrieNode,
     token_text: str,
 ) -> bool:
-    """Re-simulación char-por-char del token GANADOR con schema fresco.
+    """Char-by-char re-simulation of the WINNING token on a fresh schema.
 
-    QUÉ ES (por dentro):
-    - Se copia el estado commiteado (copy barata, slots) y se construye un
-      SchemaContext FRESCO (el compartido NO se toca: si el candidato falla
-      a mitad de camino, quedaría contaminado). El flag _params_object_seen
-      se SIEMBRA desde el schema real: el historial de tokens anteriores
-      ("¿ya abrimos parameters?") no puede re-derivarse de este token solo.
-    - ORDEN CRÍTICO por carácter (el mismo contrato del filter): avanzar la
-      máquina (muta trial) → allows_token(char, trial) con el schema fino
-      TODAVÍA sincronizado con el estado PRE-char → recién después
-      fine.update(trial). Si el update fuera primero, self.* == new_state.*
-      en allows_token y las cláusulas de cambio/depth (2 y 4) jamás gatillan
-      — el pase fino quedaría en no-op.
-    - ¿Por qué esto cierra los gaps? En el pase por TOKEN el schema solo ve
-      pre (commiteado) y post (simulado); acá ve TODOS los estados
-      intermedios, así las cláusulas gatillan donde antes no:
-        * Cláusula 2: el reset de current_key ("a" → "" → "b") se ve como
-          cambio y el prefix check bloquea keys inexistentes/duplicadas.
-        * Cláusula 3: el COLON intermedio expone el tipo esperado antes de
-          que el value se abra ('", "b": "x",' → string para un number se
-          bloquea en el '"' que abre el string).
-        * Cláusula 1: el cierre del name en el MISMO token gatilla la rama
-          is_complete_name (el pase por token la perdía si arrancaba fuera).
-        * Cláusula 4: el depth 0→1→0 dentro de un token dispara el ⊆ de
-          required contra keys_enclosed del estado intermedio.
-    - COMPLETE sin haber pasado por PARAMS_OBJECT → False (gap del plan:
-      el output SIEMPRE lleva "parameters", aún vacío para fn_empty).
+    WHAT IT IS:
+    - The committed state is copied (cheap copy, slots) and a FRESH
+      SchemaContext is built (the shared one is NOT touched: if the
+      candidate failed halfway it would stay contaminated). The
+      _params_object_seen flag is SEEDED from the real schema: the history
+      of previous tokens ("did we open parameters already?") cannot be
+      re-derived from this token alone.
+    - CRITICAL ORDER per character (the same contract as the filter):
+      advance the machine (mutates trial) → allows_token(char, trial) with
+      the fine schema still synced to the PRE-char state → only after that
+      fine.update(trial). If the update ran first, self.* == new_state.*
+      inside allows_token and the change/depth clauses (2 and 4) would
+      never fire — the fine pass would be a no-op.
+    - Why this closes the gaps: the per-TOKEN pass only sees pre
+      (committed) and post (simulated); here it sees EVERY intermediate
+      state, so the clauses fire where they did not before:
+        * Clause 2: the current_key reset ("a" → "" → "b") shows up as a
+          change and the prefix check blocks nonexistent/duplicate keys.
+        * Clause 3: the intermediate COLON exposes the expected type before
+          the value opens ('", "b": "x",' → a string for a number blocks
+          at the '"' that opens the string).
+        * Clause 1: closing the name inside the SAME token fires the
+          is_complete_name branch (the per-token pass lost it when the
+          token started outside).
+        * Clause 4: depth 0→1→0 inside one token triggers the ⊆ of
+          required against keys_enclosed of the intermediate state.
+    - COMPLETE without having gone through PARAMS_OBJECT → False (the
+      output ALWAYS carries "parameters", even empty for fn_empty).
     """
     trial = copy(state)
     fine = SchemaContext(functions)
-    # ⚠ El historial de tokens anteriores (¿se abrió parameters?) viene del
-    # schema real; el del token actual NO alcanza para decidir COMPLETE.
+    # Previous-token history (was parameters opened?) comes from the real
+    # schema; the current token alone cannot decide COMPLETE.
     fine._params_object_seen = schema.has_seen_params_object()
     fine.update(trial)
 
     for char in token_text:
         if not trial.update_from_text(char):
-            # Sintaxis: el filter ya validó el token completo; si un char
-            # fallara acá sería un bug del filter. Falla cerrada.
+            # Syntax: the filter already validated the whole token; a char
+            # failing here would be a filter bug. Fail closed.
             return False
-        # allows_token con schema PRE-char + estado POST-char (contrato 3.4)
+        # allows_token with PRE-char schema + POST-char state (filter contract)
         if not fine.allows_token(char, trial, trie):
             return False
-        # Recién acá el schema fino avanza al estado de este carácter.
+        # Only now does the fine schema advance to this character's state.
         fine.update(trial)
 
     if trial.phase is DecoderPhase.COMPLETE and not fine.has_seen_params_object():

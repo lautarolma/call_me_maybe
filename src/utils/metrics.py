@@ -131,7 +131,7 @@ def track_prompt(index: int) -> Iterator[None]:
 
     Prints:
         ``[Started] Prompt <index>`` before the block and
-        ``[Timming] Prompt <index>: <elapsed> ms`` after it, keeping the
+        ``[Timing] Prompt <index>: <elapsed> ms`` after it, keeping the
         timing concerns out of the pipeline loop.
     """
     print(f"[Started] Prompt {index}")
@@ -140,7 +140,7 @@ def track_prompt(index: int) -> Iterator[None]:
         yield
     finally:
         elapsed_ms = (perf_counter() - start) * 1000.0
-        print(f"[Timming] Prompt {index}: {elapsed_ms} ms")
+        print(f"[Timing] Prompt {index}: {elapsed_ms} ms")
 
 
 def report_prompt_metrics(

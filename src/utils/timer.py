@@ -15,7 +15,7 @@ def measure_time(label: str) -> Iterator[None]:
         label: Human-readable name for the measured block.
 
     Prints:
-        ``[Started] <label>`` before the block and ``[Timming] <label>:
+        ``[Started] <label>`` before the block and ``[Timing] <label>:
         <elapsed> ms`` after it.
     """
     print(f"[Started] {label}")
@@ -24,4 +24,4 @@ def measure_time(label: str) -> Iterator[None]:
         yield
     finally:
         elapsed_time = (perf_counter() - start) * 1000.0
-        print(f"[Timming] {label}: {elapsed_time} ms")
+        print(f"[Timing] {label}: {elapsed_time} ms")

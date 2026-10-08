@@ -128,7 +128,7 @@ def run(args: argparse.Namespace) -> int:
     # slower" (see report_prompt_metrics). The loop stays print-free: it only
     # accumulates.
     prompt_metrics: list[MetricsRun] = []
-    with measure_time("Prueba completa"):
+    with measure_time("Complete run"):
         for i, prompt in enumerate(prompts):
             with track_prompt(i):
                 prompt_run = MetricsRun()

@@ -2,7 +2,7 @@
 
 Loads function definitions, prompts and the model vocabulary, initializes
 the model, runs constrained generation over every prompt, validates each
-result and persists the output JSON required by the subject (V.4).
+result and persists the output JSON required by the subject.
 """
 
 from __future__ import annotations
@@ -24,8 +24,8 @@ from src.validator import build_results, find_unsupported_prompts
 
 import argparse
 
-# Import del SDK provisto por la cátedra (vive en llm_sdk/llm_sdk/__init__.py).
-# `Small_LLM_Model` envuelve un modelo causal de Hugging Face para inferencia.
+# Import of the SDK provided by the course (it lives in llm_sdk/llm_sdk/__init__.py).
+# `Small_LLM_Model` wraps a Hugging Face causal model for inference.
 from llm_sdk import Small_LLM_Model
 
 from src.loader.function_loader import load_functions
@@ -43,66 +43,65 @@ def run(args: argparse.Namespace) -> int:
     Returns:
         ``0`` on success, ``1`` on failure.
 
-    CÓMO FUNCIONA (por dentro):
-    - Es el ORQUESTADOR: no sabe cargar JSONs ni correr tensores, solo
-      coordina a los especialistas en orden y propaga excepciones hacia
-      `__main__.py`, que es quien las convierte en exit code 1.
+    HOW IT WORKS (internals):
+    - It is the ORCHESTRATOR: it does not know how to load JSONs or run
+      tensors, it only coordinates the specialists in order and propagates
+      exceptions to `__main__.py`, which turns them into exit code 1.
     """
     print(f"[1/5] Loading function definitions from {args.functions_definition} ...")
     # load_functions(path) -> list[FunctionDef]:
-    #   abre el JSON, lo parsea con json.load, valida cada entrada contra el
-    #   modelo pydantic FunctionDef (tipos, campos requeridos) y verifica que
-    #   no haya nombres duplicados. Si algo falla, lanza ValueError con
-    #   mensaje descriptivo (ver function_loader.py para el detalle).
+    #   opens the JSON, parses it with json.load, validates each entry against
+    #   the pydantic FunctionDef model (types, required fields) and checks for
+    #   duplicate names. On failure it raises ValueError with a descriptive
+    #   message (see function_loader.py for the details).
     functions = load_functions(args.functions_definition)
 
     print(f"[2/5] Loading prompts from {args.input} ...")
     # load_prompts(path) -> list[str]:
-    #   mismo mecanismo de parseo JSON, pero acepta dos formatos: array de
-    #   strings planos o array de objetos {"prompt": "..."}. Rechaza listas
-    #   vacías (no tiene sentido correr un pipeline sin inputs).
+    #   same JSON parsing mechanism, but accepts two formats: an array of
+    #   plain strings or an array of {"prompt": "..."} objects. It rejects
+    #   empty lists (running a pipeline without inputs makes no sense).
     #
-    # POR QUÉ GUARDAMOS LAS DOS LISTAS: `build_prompt` inyecta las function
-    # definitions y produce el texto que ve el MODELO. El campo `prompt` de
-    # la salida tiene que ser el request ORIGINAL, sin las definitions —
-    # la moulinette lo compara con `correction["prompt"]` por igualdad
-    # EXACTA de string. Si guardáramos solo los prompts ya construidos,
-    # escribiríamos en el output el prompt con las definitions inyectadas, y
-    # la comparación fallaría en los 11 tests.
+    # WHY WE KEEP BOTH LISTS: `build_prompt` injects the function definitions
+    # and produces the text the MODEL sees. The `prompt` field of the output
+    # must be the ORIGINAL request, without the definitions — the grader
+    # compares it with `correction["prompt"]` by EXACT string equality. If we
+    # only kept the constructed prompts, we would write the definitions-laden
+    # prompt into the output, and the comparison would fail on all 11 tests.
     raw_prompts = load_prompts(args.input)
     prompts = [build_prompt(functions, prompt) for prompt in raw_prompts]
 
     print("[3/5] Initializing model (first run downloads weights from the HF Hub) ...")
-    # Small_LLM_Model() SIN argumentos usa el default Qwen/Qwen3-0.6B.
-    # QUÉ HACE POR DENTRO (llm_sdk):
-    #   1. Elige device con prioridad mps > cuda > cpu:
-    #      - mps = Metal Performance Shaders (GPU de Apple Silicon).
-    #      - cuda = GPU NVIDIA.
-    #      - cpu = fallback universal, más lento pero siempre disponible.
-    #   2. Elige dtype: float16 en GPU/MPS (mitad de memoria, ~1.2 GB para
-    #      600M parámetros vs ~2.4 GB en float32), float32 en CPU por
-    #      compatibilidad numérica.
-    #   3. AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B"): descarga (la
-    #      primera vez) o lee del cache (~/.cache/huggingface/hub) los files
-    #      del tokenizador (vocab.json, merges.txt, tokenizer.json) y arma
-    #      el objeto que traduce texto <-> ids de tokens.
-    #   4. AutoModelForCausalLM.from_pretrained(...): ídem pero con los
-    #      PESOS del transformer (safetensors). `torch_dtype=self._dtype`
-    #      carga los pesos ya en float16 directamente.
-    #   5. .eval(): pone el modelo en modo inferencia (desactiva dropout y
-    #      otras capas con comportamiento distinto en entrenamiento).
-    #   6. requires_grad=False en todos los parámetros: le dice a autograd
-    #      de PyTorch que no registre operaciones para calcular gradientes,
-    #      lo que ahorra memoria y acelera cada forward pass.
+    # Small_LLM_Model() with no arguments uses the default Qwen/Qwen3-0.6B.
+    # WHAT IT DOES INSIDE (llm_sdk):
+    #   1. Picks the device with priority mps > cuda > cpu:
+    #      - mps = Metal Performance Shaders (Apple Silicon GPU).
+    #      - cuda = NVIDIA GPU.
+    #      - cpu = universal fallback, slower but always available.
+    #   2. Picks dtype: float16 on GPU/MPS (half the memory, ~1.2 GB for
+    #      600M parameters vs ~2.4 GB in float32), float32 on CPU for
+    #      numeric compatibility.
+    #   3. AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B"): downloads (the
+    #      first time) or reads from cache (~/.cache/huggingface/hub) the
+    #      tokenizer files (vocab.json, merges.txt, tokenizer.json) and
+    #      builds the object that maps text <-> token ids.
+    #   4. AutoModelForCausalLM.from_pretrained(...): same, but with the
+    #      transformer WEIGHTS (safetensors). `torch_dtype=self._dtype`
+    #      loads the weights already in float16.
+    #   5. .eval(): puts the model in inference mode (disables dropout and
+    #      other layers with training-specific behavior).
+    #   6. requires_grad=False on all parameters: tells PyTorch autograd
+    #      not to record operations for gradient computation, saving memory
+    #      and speeding up every forward pass.
     model = Small_LLM_Model()
 
     print("[4/5] Building vocabulary index ...")
     # load_vocab(model) -> Vocab:
-    #   lee el vocab.json DEL MODELO (via get_path_to_vocab_file, que resuelve
-    #   la ruta en el cache de HF) y pre-indexa cada token por su PRIMER
-    #   CARÁCTER DECODIFICADO. Ese índice es la base del decoder restringido:
-    #   cuando el generador necesite "todos los tokens que empiezan con `"",
-    #   responde en O(1) con un set de ids en vez de escanear 150k+ tokens.
+    #   reads the MODEL's vocab.json (via get_path_to_vocab_file, which
+    #   resolves the path in the HF cache) and pre-indexes each token by its
+    #   FIRST DECODED CHARACTER. That index is the basis of the constrained
+    #   decoder: when the generator needs "all tokens starting with `"`", it
+    #   answers in O(1) with a set of ids instead of scanning 150k+ tokens.
     vocab = load_vocab(model)
     print("[5/5] Building trie ...")
     trie_node = build_trie([function.name for function in functions])
@@ -119,14 +118,15 @@ def run(args: argparse.Namespace) -> int:
     print()
     print("All components loaded OK. Starting constrained generation.")
 
-    # Los resultados se acumulan para imprimirlos fuera del loop: el ciclo de
-    # generación queda libre de prints y mediciones directas (eso vive en
+    # Results are accumulated to print them outside the loop: the generation
+    # cycle stays free of prints and direct measurements (those live in
     # src/utils/metrics.py).
     generated: list[str] = []
-    # Un MetricsRun POR PROMPT, no uno acumulado: el conteo de forwards es la
-    # única magnitud que NO depende del hardware, así que es la que permite
-    # separar "el código hizo más trabajo" de "la máquina estuvo más lenta"
-    # (ver report_prompt_metrics). El loop sigue sin prints: sólo acumula.
+    # One MetricsRun PER PROMPT, not a single accumulator: the forward count
+    # is the only magnitude that does NOT depend on the hardware, so it is the
+    # one that separates "the code did more work" from "the machine was
+    # slower" (see report_prompt_metrics). The loop stays print-free: it only
+    # accumulates.
     prompt_metrics: list[MetricsRun] = []
     with measure_time("Prueba completa"):
         for i, prompt in enumerate(prompts):
@@ -144,35 +144,35 @@ def run(args: argparse.Namespace) -> int:
                 )
                 prompt_metrics.append(prompt_run)
 
-    # El conteo de forwards vive en data/output/ (git-ignored, junto al
-    # entregable) y NO en /tmp: la evidencia de medición tiene que sobrevivir
-    # al reinicio de la VM.
+    # The forward count lives in data/output/ (git-ignored, next to the
+    # deliverable) and NOT in /tmp: the measurement evidence must survive a
+    # VM restart.
     report_prompt_metrics(prompt_metrics, args.output.parent / "decode_metrics.json")
 
-    # --- Persistencia del entregable (subject V.4) -------------------------
-    # Convertimos cada string del decoder en una FunctionCall validada,
-    # emparejada con su prompt ORIGINAL, y escribimos el array a disco.
-    # `build_results` conserva el orden 1:1 con los prompts de entrada: la
-    # moulinette empareja con `zip()`, que es posicional.
+    # --- Deliverable persistence -------------------------------------------
+    # We turn each decoder string into a validated FunctionCall, paired with
+    # its ORIGINAL prompt, and write the array to disk. `build_results`
+    # preserves the 1:1 order with the input prompts: the grader pairs with
+    # `zip()`, which is positional.
     results: list[FunctionCall] = build_results(raw_prompts, generated)
 
-    # El eco de stdout va DESPUÉS de `build_results`, no antes: lo que se
-    # imprime tiene que ser lo que queda en el archivo. Antes se imprimía el
-    # string crudo del decoder y la consola mostraba `replacement: "****"` y
-    # `template: 'Say hello to {name}'` mientras el JSON en disco ya traía
-    # `*` y `Say "hello" to {name}`. El corretero scorea el archivo, así que
-    # el score era 11/11 igual — pero un revisor que lee la consola veía
-    # output roto. Se imprime `name` + `parameters` (no el `prompt`, que ya
-    # se imprimió al leer la entrada) con el MISMO formato que antes.
+    # The stdout echo comes AFTER `build_results`, not before: what is
+    # printed must be what stays in the file. It used to print the decoder's
+    # raw string and the console showed `replacement: "****"` and
+    # `template: 'Say hello to {name}'` while the JSON on disk already had
+    # `*` and `Say "hello" to {name}`. The grader scores the file, so the
+    # score was still 11/11 — but a reviewer reading the console saw broken
+    # output. It prints `name` + `parameters` (not `prompt`, already printed
+    # when reading the input) in the SAME format as before.
     for call in results:
         print(f"  result : {json.dumps(call.echo_view(), indent=2, ensure_ascii=False)}")
 
-    # --- Diagnóstico de prompts sin match (stderr, nunca el JSON) ----------
-    # El decoder restringido siempre emite una función válida, así que un
-    # prompt que no corresponde a ninguna no crashea: elige la que menos feo
-    # queda y sigue. Sin este aviso el output parece correcto. No altera el
-    # archivo de resultados ni el score — es un sensor para quien lee la
-    # corrida. Ver `find_unsupported_prompts` para el criterio.
+    # --- Diagnostics for unmatched prompts (stderr, never the JSON) --------
+    # The constrained decoder always emits a valid function, so a prompt that
+    # matches no function does not crash: it picks the least ugly one and
+    # moves on. Without this warning the output looks correct. It does not
+    # alter the results file or the score — it is a sensor for whoever reads
+    # the run. See `find_unsupported_prompts` for the criterion.
     for idx in find_unsupported_prompts(raw_prompts, results):
         print(
             f"WARNING: prompt {idx} produced a call with no argument value "
@@ -189,22 +189,22 @@ def run(args: argparse.Namespace) -> int:
 
 
 def write_results(results: list[FunctionCall], path: Path) -> Path:
-    """Serializa los resultados al JSON de salida y lo escribe en disco.
+    """Serialize the results to the output JSON and write it to disk.
 
     Args:
-        results: Entries validadas, en el orden de los prompts de entrada.
-        path: Destino. El parent se crea si no existe (el subject exige que
-            el programa cree el directorio output/ durante la ejecución).
+        results: Validated entries, in the order of the input prompts.
+        path: Destination. The parent is created if missing (the subject
+            requires the program to create the output/ directory at run time).
 
     Returns:
-        El path efectivamente escrito.
+        The path actually written.
 
-    POR QUÉ `model_dump()` y no `model_dump_json()`:
-    `json.dumps` sobre una lista de dicts es más simple de testear (el
-    resultado es texto plano, no bytes) y mantiene el control del indent.
-    `ensure_ascii=False` importa: los prompts contienen acentos y comillas
-    tipográficas; sin esto el JSON los escapa como \\uXXXX, sigue siendo
-    válido pero ilegible para un revisor humano.
+    WHY `model_dump()` and not `model_dump_json()`:
+    `json.dumps` over a list of dicts is simpler to test (the result is plain
+    text, not bytes) and keeps control of the indent. `ensure_ascii=False`
+    matters: the prompts contain accents and typographic quotes; without it
+    the JSON escapes them as \\uXXXX, which is still valid but unreadable for
+    a human reviewer.
     """
     payload = [call.model_dump() for call in results]
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,18 +1,18 @@
-"""Tests de SchemaContext (Task 3.3).
+"""Tests for SchemaContext.
 
-VOLUNTAD DE ESTOS TESTS (por dentro):
-- No testean SchemaContext aislado: caminan la state machine REAL
-  (DecoderState.update_from_text) y sincronizan el schema después de cada
-  token, como hace el generator en Task 4.1 (orden exacto del plan:
-  state.update_from_text(token) → schema.update(state)). Si la state
-  machine cambia sus fases, estos tests pinchan y hay que revisar el
-  contrato.
-- El fixture de datos replica las funciones reales de
-  data/input/functions_definition.json (convención del proyecto).
-- La resolución de la función seleccionada depende de state.name_buffer
-  (⚠ desvío documentado en state.py): el name lo acumula LA STATE MACHINE,
-  no el schema. El caso token-mixto (name + estructura en el MISMO token)
-  es el que justifica ese diseño.
+INTENT OF THESE TESTS (in a nutshell):
+- They do not test SchemaContext in isolation: they walk the REAL state
+  machine (DecoderState.update_from_text) and sync the schema after each
+  token, exactly as the generator does (order fixed by the plan:
+  state.update_from_text(token) -> schema.update(state)). If the state
+  machine changes its phases, these tests fail and the contract must be
+  revisited.
+- The data fixture replicates the real functions in
+  data/input/functions_definition.json (project convention).
+- Resolving the selected function depends on state.name_buffer
+  (documented deviation in state.py): the name is accumulated by THE STATE
+  MACHINE, not by the schema. The mixed-token case (name + structure in the
+  SAME token) is what justifies that design.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from src.decoder.state import DecoderState
 from src.decoder.trie import TrieNode, build_trie
 from src.models.function_definition import FunctionDef, ParameterDef
 
-# Replica de data/input/functions_definition.json (subset usado en tests).
+# Replica of data/input/functions_definition.json (subset used in tests).
 FUNCTIONS = [
     FunctionDef(
         name="fn_add_numbers",
@@ -54,29 +54,29 @@ FN_GREET = next(fn for fn in FUNCTIONS if fn.name == "fn_greet")
 
 
 def step(schema: SchemaContext, state: DecoderState, token: str) -> None:
-    """Avanza el estado con un token y sincroniza el schema (contrato Task 4.1)."""
+    """Advance the state with a token and sync the schema (generator contract)."""
     assert state.update_from_text(token), f"state machine rejected {token!r}"
     schema.update(state)
 
 
 class TestNameResolution:
-    """Resolución de selected_function desde el value de "name"."""
+    """Resolution of selected_function from the "name" value."""
 
     def test_resolves_function_when_name_closes(self) -> None:
         schema = SchemaContext(FUNCTIONS)
         state = DecoderState()
         step(schema, state, '{"name": "')
-        assert schema.selected_function is None  # el buffer aún está vacío
+        assert schema.selected_function is None  # buffer still empty
         step(schema, state, "fn_add_numbers")
         assert schema.selected_function is FN_ADD
         step(schema, state, '"')
-        assert schema.selected_function is FN_ADD  # ya resuelto: no cambia
+        assert schema.selected_function is FN_ADD  # already resolved: no change
 
     def test_resolution_survives_mid_token_transition(self) -> None:
-        """EL caso que justifica el diseño: el name cierra Y el mismo token
-        arranca "parameters". El estado post-token tiene current_key
-        "parameters"; sin el name_buffer de la state machine, la resolución
-        sería imposible."""
+        """THE case that justifies the design: the name closes AND the same
+        token opens "parameters". The post-token state has current_key
+        "parameters"; without the state machine's name_buffer, resolution
+        would be impossible."""
 
         schema = SchemaContext(FUNCTIONS)
         state = DecoderState()
@@ -85,7 +85,7 @@ class TestNameResolution:
         assert schema.selected_function is FN_ADD
 
     def test_partial_name_does_not_resolve(self) -> None:
-        """Un prefijo parcial no está en el índice: se espera a completar."""
+        """A partial prefix is not in the index: wait until it is complete."""
 
         schema = SchemaContext(FUNCTIONS)
         state = DecoderState()
@@ -96,18 +96,18 @@ class TestNameResolution:
         assert schema.selected_function is FN_GREET
 
     def test_param_named_name_does_not_contaminate_resolution(self) -> None:
-        """fn_greet tiene un parámetro "name" (depth 1): no re-resuelve."""
+        """fn_greet has a "name" parameter (depth 1): it does not re-resolve."""
 
         schema = SchemaContext(FUNCTIONS)
         state = DecoderState()
         step(schema, state, '{"name": "fn_greet", "parameters": {')
         assert schema.selected_function is FN_GREET
         step(schema, state, '"name": "Javier"')
-        assert schema.selected_function is FN_GREET  # sigue siendo la misma
-        assert schema.required_keys_remaining() == set()  # "name" ya emitido
+        assert schema.selected_function is FN_GREET  # still the same
+        assert schema.required_keys_remaining() == set()  # "name" already emitted
 
     def test_unknown_name_leaves_no_selection(self) -> None:
-        """Nombre que no existe en el índice (defensivo; el trie lo bloquea)."""
+        """Name that does not exist in the index (defensive; the trie blocks it)."""
 
         schema = SchemaContext(FUNCTIONS)
         state = DecoderState()
@@ -120,11 +120,11 @@ class TestCurrentExpectedType:
     def test_name_value_is_string(self) -> None:
         schema = SchemaContext(FUNCTIONS)
         state = DecoderState()
-        step(schema, state, '{"name":')  # COLON con current_key "name"
+        step(schema, state, '{"name":')  # COLON with current_key "name"
         assert schema.current_expected_type() == "string"
 
     def test_parameters_key_has_no_scalar_type(self) -> None:
-        """"parameters" es un objeto: sin tipo escalar que constreñir."""
+        """"parameters" is an object: no scalar type to constrain."""
 
         schema = SchemaContext(FUNCTIONS)
         state = DecoderState()
@@ -139,7 +139,7 @@ class TestCurrentExpectedType:
         assert schema.current_expected_type() == "number"
 
     def test_string_param_named_name_type(self) -> None:
-        """El parámetro "name" de fn_greet (depth 1) es string, no el output."""
+        """The "name" parameter of fn_greet (depth 1) is string, not the output."""
 
         schema = SchemaContext(FUNCTIONS)
         state = DecoderState()
@@ -153,8 +153,8 @@ class TestCurrentExpectedType:
         assert schema.current_expected_type() is None
 
     def test_params_before_name_unconstrained(self) -> None:
-        """Si "parameters" aparece ANTES del name, el tipo no se conoce
-        (conservador: el filter igual bloquea por sintaxis y trie)."""
+        """If "parameters" appears BEFORE the name, the type is unknown
+        (conservative: the filter still blocks by syntax and trie)."""
 
         schema = SchemaContext(FUNCTIONS)
         state = DecoderState()
@@ -162,7 +162,7 @@ class TestCurrentExpectedType:
         assert schema.current_expected_type() is None
 
     def test_no_expected_type_outside_value_phases(self) -> None:
-        """En IN_KEY el tipo del value FUTURO aún no aplica."""
+        """In IN_KEY the FUTURE value's type does not apply yet."""
 
         schema = SchemaContext(FUNCTIONS)
         state = DecoderState()
@@ -181,7 +181,7 @@ class TestRequiredKeys:
         schema = SchemaContext(FUNCTIONS)
         state = DecoderState()
         step(schema, state, '{"name": "fn_add_numbers", "parameters": {"a": 2.0')
-        step(schema, state, " }")  # cierra "a" con ws + '}' de params
+        step(schema, state, " }")  # closes "a" with ws + '}' of params
         assert schema.required_keys_remaining() == {"b"}
 
     def test_no_selection_means_unknown(self) -> None:
@@ -193,15 +193,15 @@ class TestRequiredKeys:
 
 class TestCanCloseParams:
     def test_cannot_close_with_missing_required(self) -> None:
-        """EL test clave: la sintaxis PERMITE '}' pero el schema lo bloquea."""
+        """THE key test: the syntax PERMITS '}' but the schema blocks it."""
 
         schema = SchemaContext(FUNCTIONS)
         state = DecoderState()
         step(schema, state, '{"name": "fn_add_numbers", "parameters": {"a": 2.0')
-        step(schema, state, " }")  # sintácticamente válido: params cerrado
-        assert state.phase.name == "VALUE_END"  # la máquina lo aceptó
+        step(schema, state, " }")  # syntactically valid: params closed
+        assert state.phase.name == "VALUE_END"  # the machine accepted it
         assert state.depth == 0
-        assert not schema.can_close_params()  # pero falta "b"
+        assert not schema.can_close_params()  # but "b" is missing
 
     def test_can_close_after_all_required(self) -> None:
         schema = SchemaContext(FUNCTIONS)
@@ -218,7 +218,7 @@ class TestCanCloseParams:
         assert schema.can_close_params()  # zero required keys
 
     def test_no_selection_is_conservative(self) -> None:
-        """Sin función conocida no se puede afirmar que puede cerrar."""
+        """With no known function, one cannot assert it can close."""
 
         schema = SchemaContext(FUNCTIONS)
         assert schema.required_keys_remaining() == set()
@@ -228,7 +228,7 @@ class TestCanCloseParams:
 
 class TestEndToEnd:
     def test_full_json_walk(self) -> None:
-        """Camina el JSON COMPLETO de fn_add_numbers con checkpoints."""
+        """Walk the COMPLETE fn_add_numbers JSON with checkpoints."""
 
         schema = SchemaContext(FUNCTIONS)
         state = DecoderState()
@@ -237,12 +237,12 @@ class TestEndToEnd:
         assert schema.selected_function is FN_ADD
         assert schema.required_keys_remaining() == set()
         assert schema.can_close_params()
-        step(schema, state, "}")  # '}' final del output object
+        step(schema, state, "}")  # final '}' of the output object
         assert state.phase.name == "COMPLETE"
 
 
-#: Réplica de `fn_is_even` (definición PRIVADA de la moulinette):
-#: `{"n": {"type": "integer"}}`. Es el caso que rompía el decoder.
+#: Replica of `fn_is_even` (a PRIVATE definition of the grader):
+#: `{"n": {"type": "integer"}}`. This is the case that used to break the decoder.
 INTEGER_FUNCTIONS = [
     FunctionDef(
         name="fn_is_even",
@@ -254,27 +254,27 @@ INTEGER_FUNCTIONS = [
 
 
 class TestIntegerParamIsNumeric:
-    """REGRESIÓN del P0: un parámetro "integer" DEBE aceptar tokens numéricos.
+    """REGRESSION for integer parameters: an "integer" MUST accept numeric tokens.
 
-    CONTEXTO DEL BUG (por qué esta clase existe):
-    "integer" no es un tipo de JSON: es el de la moulinette para "int de
-    Python", y sólo aparece en las definiciones PRIVADAS
+    BUG CONTEXT (why this class exists):
+    "integer" is not a JSON type: it is the grader's type for a "Python int",
+    and it only appears in PRIVATE definitions
     (`fn_is_even.n`, `fn_calculate_compound_interest.years`).
 
-    La cláusula 3 comparaba `kind == param.type` con IGUALDAD. Todo token
-    numérico declara kind "number" (_PHASE_KIND / _VALUE_START_KINDS), así que
-    con igualdad un "integer" declarado rechazaba CADA token candidato: el
-    allowed set quedaba vacío y el decoder se colgaba sin generar nada.
+    Clause 3 compared `kind == param.type` with EQUALITY. Every numeric token
+    declares kind "number" (_PHASE_KIND / _VALUE_START_KINDS), so with equality
+    a declared "integer" rejected EVERY candidate token: the allowed set ended
+    up empty and the decoder hung without generating anything.
 
-    ⚠️ Estos tests usan `SchemaContext.allows_token`, NO el helper `step()` de
-    arriba. `step()` sólo camina la state machine (sintaxis) y por eso NUNCA
-    tocó la cláusula de tipo: la cobertura de `allows_token` era CERO, que es
-    exactamente por lo que el bug sobrevivió a 196 tests verdes. El tipo se
-    decide en la cláusula 3, que sólo se consulta al filtrar candidatos.
+    These tests use `SchemaContext.allows_token`, NOT the `step()` helper above.
+    `step()` only walks the state machine (syntax) and therefore NEVER touched
+    the type clause: `allows_token` coverage was ZERO, which is exactly why the
+    bug survived to a green suite. The type is decided by clause 3, which is
+    only consulted when filtering candidates.
     """
 
     def _at_param_start(self) -> tuple[SchemaContext, DecoderState, TrieNode]:
-        """Estado real justo después del ':' que abre el valor de "n"."""
+        """Real state right after the ':' that opens the "n" value."""
         schema = SchemaContext(INTEGER_FUNCTIONS)
         state = DecoderState()
         step(schema, state, '{"name": "fn_is_even", "parameters": {"n":')
@@ -282,51 +282,51 @@ class TestIntegerParamIsNumeric:
         return schema, state, trie
 
     def test_integer_param_accepts_digit(self) -> None:
-        """El token '1' tiene kind "number" y DEBE ser válido para "integer"."""
+        """The token '1' has kind "number" and MUST be valid for "integer"."""
         schema, state, trie = self._at_param_start()
         ok, new_state = state.simulate("1")
-        assert ok, "1 es sintaxis válida"
+        assert ok, "1 is valid syntax"
         assert schema.allows_token("1", new_state, trie), (
-            "un 'integer' declarado debe aceptar un dígito: con kind==type "
-            "ningún token numérico pasaba y el decoder no tenía candidatos"
+            "a declared 'integer' must accept a digit: with kind==type "
+            "no numeric token passed and the decoder had no candidates"
         )
 
     def test_integer_param_accepts_negative(self) -> None:
-        """'-' también es kind "number": los negativos no deben quedar colgados."""
+        """'-' is also kind "number": negatives must not hang."""
         schema, state, trie = self._at_param_start()
         ok, new_state = state.simulate("-")
         assert ok
         assert schema.allows_token("-", new_state, trie)
 
     def test_integer_param_rejects_decimal_point(self) -> None:
-        """Cláusula 5: un "integer" NO admite '.', aunque JSON lo permita.
+        """Clause 5: an "integer" does NOT allow '.', even if JSON permits it.
 
-        ⚠ Este test invertía su propia premisa ("JSON no distingue int de
-        float"). Para el SPEC es cierto, pero el evaluador no es un validador
-        de JSON: ejecuta `fn_is_even(n=2.5)` y revienta con
-        `assert isinstance(n, int)`. La syntacticidad la valida state.py; que
-        el LITERAL tenga forma de int es una regla de capa semántica
-        (SchemaContext), y por eso vive acá y no en el gramático.
+        This test used to invert its own premise ("JSON does not distinguish
+        int from float"). For the SPEC that is true, but the evaluator is not a
+        JSON validator: it runs `fn_is_even(n=2.5)` and blows up with
+        `assert isinstance(n, int)`. Syntax is validated by state.py; that the
+        LITERAL has int shape is a semantic layer rule (SchemaContext), which
+        is why it lives here and not in the grammar.
         """
         schema, state, trie = self._at_param_start()
         ok, new_state = state.simulate("2.5")
-        assert ok, "la sintaxis de '2.5' es JSON válido: el reject es del schema"
+        assert ok, "the syntax of '2.5' is valid JSON: the reject comes from the schema"
         assert not schema.allows_token("2.5", new_state, trie), (
-            "un 'integer' no puede materializarse como float: la moulinette "
-            "corre assert isinstance(n, int) sobre el valor parseado"
+            "an 'integer' cannot materialize as float: the grader runs "
+            "assert isinstance(n, int) over the parsed value"
         )
 
     def test_integer_param_rejects_exponent(self) -> None:
-        """idem con notación exponencial: '1e3' parsea a float en Python."""
+        """Same with exponent notation: '1e3' parses to float in Python."""
         schema, state, trie = self._at_param_start()
         ok, new_state = state.simulate("1e3")
         assert ok
         assert not schema.allows_token("1e3", new_state, trie), (
-            "1e3 es un float de Python aunque se escriba sin punto"
+            "1e3 is a Python float even when written without a dot"
         )
 
     def test_number_param_accepts_decimal_point(self) -> None:
-        """Contracara: un "number" SÍ debe admitir la forma float (2.5)."""
+        """Counterpart: a "number" MUST accept the float form (2.5)."""
         schema = SchemaContext(FUNCTIONS)  # fn_add_numbers.a: number
         state = DecoderState()
         step(schema, state, '{"name": "fn_add_numbers", "parameters": {"a":')
@@ -334,35 +334,35 @@ class TestIntegerParamIsNumeric:
         ok, new_state = state.simulate("2.5")
         assert ok
         assert schema.allows_token("2.5", new_state, trie), (
-            "la cláusula 5 sólo restringe a 'integer': no debe cerrar el "
-            "camino float de un 'number'"
+            "clause 5 only restricts 'integer': it must not close the "
+            "float path of a 'number'"
         )
 
     def test_integer_param_rejects_string(self) -> None:
-        """Relajar el eje numérico NO abre la puerta a strings."""
+        """Relaxing the numeric axis does NOT open the door to strings."""
         schema, state, trie = self._at_param_start()
-        ok, new_state = state.simulate('"hola"')
-        assert ok, "la sintaxis del string es válida"
-        assert not schema.allows_token('"hola"', new_state, trie), (
-            "un string no puede satisfacer un parámetro 'integer'"
+        ok, new_state = state.simulate('"hello"')
+        assert ok, "the string syntax is valid"
+        assert not schema.allows_token('"hello"', new_state, trie), (
+            "a string cannot satisfy an 'integer' parameter"
         )
 
     def test_integer_param_rejects_boolean(self) -> None:
-        """idem con boolean: kind 'boolean' no pertenece a la familia numérica."""
+        """Same with boolean: kind 'boolean' does not belong to the numeric family."""
         schema, state, trie = self._at_param_start()
         ok, new_state = state.simulate("true")
         assert ok
         assert not schema.allows_token("true", new_state, trie)
 
     def test_integer_param_rejects_null(self) -> None:
-        """idem con null."""
+        """Same with null."""
         schema, state, trie = self._at_param_start()
         ok, new_state = state.simulate("null")
         assert ok
         assert not schema.allows_token("null", new_state, trie)
 
     def test_integer_param_walks_to_complete(self) -> None:
-        """Camina el JSON completo: el fix no sólo permite el token, termina."""
+        """Walk the whole JSON: the fix does not only permit the token, it terminates."""
         schema = SchemaContext(INTEGER_FUNCTIONS)
         state = DecoderState()
         step(schema, state, '{"name": "fn_is_even", "parameters": {"n": 4')
@@ -372,7 +372,7 @@ class TestIntegerParamIsNumeric:
         assert state.phase.name == "COMPLETE"
 
     def test_number_still_rejects_boolean(self) -> None:
-        """Guarda contra regresión: relajar 'integer' tampoco relajó 'number'."""
+        """Guard against regression: relaxing 'integer' did not relax 'number'."""
         schema = SchemaContext(FUNCTIONS)
         state = DecoderState()
         step(schema, state, '{"name": "fn_add_numbers", "parameters": {"a":')
@@ -382,7 +382,7 @@ class TestIntegerParamIsNumeric:
         assert not schema.allows_token("false", new_state, trie)
 
     def test_number_param_accepts_digit(self) -> None:
-        """Guarda contra regresión: 'number' sigue aceptando dígitos."""
+        """Guard against regression: 'number' still accepts digits."""
         schema = SchemaContext(FUNCTIONS)
         state = DecoderState()
         step(schema, state, '{"name": "fn_add_numbers", "parameters": {"a":')

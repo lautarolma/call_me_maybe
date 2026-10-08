@@ -2,12 +2,12 @@
 
 Run with ``uv run python -m src``.
 
-ROL DE ESTE __init__.py:
-- Convierte el directorio `src/` en un PACKAGE importable. Sin este archivo,
-  `python -m src` y los imports `from src.cli import ...` no funcionarían.
-- Al ejecutarse en cada import del package, debe permanecer LIVIANO: solo
-  metadata (versión). Poner lógica acá ralentizaría cada import y crearía
-  dependencias circulares potenciales.
+ROLE OF THIS __init__.py:
+- It turns the `src/` directory into an importable PACKAGE. Without this file,
+  `python -m src` and the `from src.cli import ...` imports would not work.
+- Since it runs on every import of the package, it must stay LIGHT: only
+  metadata (version). Putting logic here would slow down every import and
+  create potential circular dependencies.
 """
 
 __version__ = "0.1.0"

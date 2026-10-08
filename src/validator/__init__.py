@@ -1,11 +1,11 @@
 """Output validation layer (I/O boundary).
 
 Public API:
-    parse_output            — string crudo del decoder -> dict
+    parse_output            — raw decoder string -> dict
     build_function_call     — (prompt, dict) -> FunctionCall
-    validate_output         — string crudo + definiciones -> FunctionCall | str
-    build_results           — (prompts, generaciones) -> list[FunctionCall]
-    find_unsupported_prompts — prompts sin ningún valor respaldado por su texto
+    validate_output         — raw string + definitions -> FunctionCall | str
+    build_results           — (prompts, generations) -> list[FunctionCall]
+    find_unsupported_prompts — prompts with no value backed by their text
 """
 
 from __future__ import annotations

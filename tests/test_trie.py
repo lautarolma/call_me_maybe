@@ -1,15 +1,15 @@
-"""Tests del trie de nombres de funciones (Task 3.2).
+"""Tests for the function-name trie.
 
-Construcción desde las 5 funciones reales del proyecto, prefix matching,
-y validación de nombres completos.  La convención del proyecto: los tests
-replican los datos reales de functions_definition.json.
+Built from the project's 5 real functions, prefix matching, and full-name
+validation. The project convention: tests replicate the real data from
+functions_definition.json.
 """
 
 import pytest
 
 from src.decoder.trie import TrieNode, build_trie, find_node, is_complete_name, valid_next_chars
 
-# Mismas 5 funciones que data/input/functions_definition.json
+# Same 5 functions as data/input/functions_definition.json
 FUNCTIONS = [
     "fn_add_numbers",
     "fn_greet",
@@ -26,13 +26,13 @@ def trie() -> TrieNode:
 
 class TestBuildTrie:
     def test_root_is_empty_node(self, trie: TrieNode) -> None:
-        """La raíz no es nombre final y tiene hijos por cada primer carácter."""
+        """The root is not a final name and has children for each first character."""
         assert not trie.is_end
         assert trie.function_name is None
         assert "f" in trie.children
 
     def test_common_prefix_shared(self, trie: TrieNode) -> None:
-        """`fn_` es un prefijo común: una sola rama f→n→_."""
+        """`fn_` is a common prefix: a single branch f→n→_."""
         node = find_node(trie, "fn_")
         assert node is not None
         assert set(node.children.keys()) == {"a", "g", "r", "s"}
@@ -42,7 +42,7 @@ class TestBuildTrie:
         assert trie.children == {}
 
     def test_duplicate_names_store_once(self) -> None:
-        """Construir con duplicados no rompe; el nodo terminal queda igual."""
+        """Building with duplicates does not break; the terminal node stays the same."""
         trie = build_trie(["fn_a", "fn_a"])
         node = find_node(trie, "fn_a")
         assert node is not None
@@ -67,18 +67,18 @@ class TestFindNode:
         assert find_node(trie, "") is trie
 
     def test_find_partial_divergence_returns_none(self, trie: TrieNode) -> None:
-        """fn_g es prefijo existente; el path se corta donde diverge."""
+        """fn_g is an existing prefix; the path is cut where it diverges."""
         assert find_node(trie, "fn_z") is None
 
 
 class TestValidNextChars:
     def test_acceptance_criteria_fn_a(self, trie: TrieNode) -> None:
-        """Criterio de aceptación del plan: valid_next_chars("fn_a") == {"d"}."""
+        """Plan acceptance criterion: valid_next_chars("fn_a") == {"d"}."""
         assert valid_next_chars(trie, "fn_a") == {"d"}
 
     def test_fn_g_shared_branch(self, trie: TrieNode) -> None:
-        """fn_greet y fn_get_square_root comparten fn_g y divergen ahí:
-        greet sigue con 'r', get_square_root con 'e'."""
+        """fn_greet and fn_get_square_root share fn_g and diverge there:
+        greet continues with 'r', get_square_root with 'e'."""
         assert valid_next_chars(trie, "fn_g") == {"e", "r"}
 
     def test_fn_reverse(self, trie: TrieNode) -> None:
@@ -88,18 +88,18 @@ class TestValidNextChars:
         assert valid_next_chars(trie, "xyz") == set()
 
     def test_empty_prefix_returns_first_chars(self, trie: TrieNode) -> None:
-        """Prefijo vacío = raíz: todos los primeros caracteres posibles."""
+        """Empty prefix = root: every possible first character."""
         assert valid_next_chars(trie, "") == {"f"}
 
     def test_full_name_has_no_char_after(self, trie: TrieNode) -> None:
-        """Un nombre completo no tiene más hijos (no es prefijo de otro)."""
+        """A complete name has no further children (it is not a prefix of another)."""
         assert valid_next_chars(trie, "fn_add_numbers") == set()
 
 
 class TestIsCompleteName:
     def test_full_names_are_complete(self, trie: TrieNode) -> None:
         for name in FUNCTIONS:
-            assert is_complete_name(trie, name), f"{name} debería ser completo"
+            assert is_complete_name(trie, name), f"{name} should be complete"
 
     def test_prefix_is_not_complete(self, trie: TrieNode) -> None:
         assert not is_complete_name(trie, "fn_add")
@@ -109,9 +109,9 @@ class TestIsCompleteName:
         assert not is_complete_name(trie, "fn_other")
 
     def test_empty_prefix_not_complete(self, trie: TrieNode) -> None:
-        """La raíz no representa un nombre completo."""
+        """The root does not represent a complete name."""
         assert not is_complete_name(trie, "")
 
     def test_prefix_of_another_is_not_complete(self, trie: TrieNode) -> None:
-        """fn_get es prefijo de fn_get_square_root pero no es nombre completo."""
+        """fn_get is a prefix of fn_get_square_root but is not a complete name."""
         assert not is_complete_name(trie, "fn_get")

@@ -200,7 +200,7 @@ class SchemaContext:
         """
         return self._params_object_seen
 
-    # ------------------------------------------------ Fase 3 del filter (3.4)
+    # ------------------------------------------------ Phase 3 of the filter
 
     def allows_token(
         self, token_text: str, new_state: DecoderState, trie: TrieNode
@@ -256,7 +256,7 @@ class SchemaContext:
             return
         self.selected_function = self._index.get(state.name_buffer)
 
-    # ------------------------------------------------ cláusulas de Fase 3
+    # ------------------------------------------------ Phase 3 clauses
 
     def _allows_name_value(
         self, new_state: DecoderState, trie: TrieNode
@@ -357,15 +357,16 @@ class SchemaContext:
         return _declared_type_accepts(kind, param.type)
 
     def _allows_integer_form(self, token_text: str) -> bool:
-        """Cláusula 5: el literal de un parámetro "integer" no lleva '.', 'e' ni 'E'.
+        """Clause 5: an "integer" parameter's literal carries no '.', 'e' or 'E'.
 
-        La moulinette ejecuta `fn(**params)` con `assert isinstance(n, int)`:
-        `4.0` o `1e3` (floats en Python) dan 0 puntos aunque sean JSON válido.
+        The grader runs `fn(**params)` with `assert isinstance(n, int)`:
+        `4.0` or `1e3` (Python floats) score 0 even if they are valid JSON.
 
-        Trigger por estado COMMITEADO: el token arranca en COLON (puede abrir
-        el value) o dentro de IN_NUMBER_VALUE (lo continúa), a depth 1 y con
-        el parámetro declarado "integer". Solo se inspecta el tramo del token
-        previo al primer terminador: lo que viene después ya no es del literal.
+        Trigger by committed state: the token starts at COLON (it may open the
+        value) or inside IN_NUMBER_VALUE (it continues it), at depth 1 and with
+        the parameter declared "integer". Only the stretch of the token before
+        the first terminator is inspected: what comes after is no longer part
+        of the literal.
         """
         if self._phase not in (DecoderPhase.COLON, DecoderPhase.IN_NUMBER_VALUE):
             return True

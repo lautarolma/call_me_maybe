@@ -86,7 +86,7 @@ def compute_allowed_ids(
     """
     expected_chars = state.expected_first_chars()
 
-    # Fase 1: pre-filtro por primer carácter (decodificado).
+    # Phase 1: pre-filter by first (decoded) character.
     _STATIC_PREINDEX_PHASES = {
         DecoderPhase.ROOT,
         DecoderPhase.OBJECT_OPEN,
@@ -111,9 +111,9 @@ def compute_allowed_ids(
         for char in expected_chars:
             candidate_ids.update(vocab.tokens_starting_with.get(char, set()))
 
-    # ─── OPTIMIZACIÓN (Anexo de Latencia — M1/M2) ───
-    # Si logits se proveyeron, usar Top-1 opportunistic (O(1)) y luego
-    # Top-K masking (O(K)) para reducir el universo de candidatos.
+    # ─── OPTIMIZATION (M1/M2) ───
+    # If logits are provided, use Top-1 opportunistic (O(1)) then Top-K
+    # masking (O(K)) to shrink the candidate universe.
     if logits is not None:
         # M1: top-1 opportunistic: if the highest-logit token passes
         # simulate + allows_token, return immediately.
@@ -157,11 +157,11 @@ def compute_allowed_ids(
             if checked >= len(ranked_ids):
                 break
 
-        # Fallback: si ningún tier encontró uno válido, retornar vacío
-        # (el caller manejará el empty set).
+        # Fallback: if no tier found a valid one, return empty
+        # (the caller handles the empty set).
         return set()
 
-    # Fase 2: validación char-by-char (state machine) sobre texto decodificado.
+    # Phase 2: char-by-char validation (state machine) over decoded text.
     allowed_ids: set[int] = set()
     for token_id in candidate_ids:
         decoded = vocab.id2decoded.get(token_id)
@@ -171,7 +171,7 @@ def compute_allowed_ids(
         if not valid:
             continue
 
-        # Fase 3: schema constraints (trie, keys, tipos, cierres).
+        # Phase 3: schema constraints (trie, keys, types, closures).
         if schema.allows_token(decoded, new_state, trie):
             allowed_ids.add(token_id)
 

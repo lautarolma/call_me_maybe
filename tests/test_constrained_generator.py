@@ -1,26 +1,26 @@
-"""Tests del constrained generator (Task 4.1) + pase fino (Inciso 4.1.1).
+"""Tests for the constrained generator + fine pass.
 
-VOLUNTAD DE ESTOS TESTS (por dentro):
-- Testean el generator con un FakeModel que avanza una secuencia fija de
-  tokens (logits altos para el siguiente token de la secuencia, bajos para
-  el resto): el argmax elige el target cuando está en allowed.
-- La MITAD de los tests es del PASO FINO (Inciso 4.1.1): los gaps que el
-  filter (Task 3.4) deja pasar por diseño (abstención por estados límite)
-  DEBEN ser rechazados por la re-simulación char-por-char del ganador:
-    * gap 2 residual 2: token que entra a parameters + primera key en un
-      token ('", "parameters": {"a') — key válida pasa, key inválida se
-      bloquea (antes la inválida entraba de contrabando).
-    * gap 3: key+value+cierre completos en un token (', "b": "x",' con
-      "b": number) — el pase fino lo bloquea; el filter lo permitía (B8).
-    * gap 4: entrar Y salir de parameters en un token — sin todos los
-      required se bloquea; con todos, pasa.
-    * slip del duplicado exacto ('"a": 4' con "a" ya emitida) — bloqueado.
-    * gap del plan: output COMPLETE sin haber pasado por PARAMS_OBJECT
-      ('}' tras el name sólamente) — bloqueado.
-- Cada token del vocab mock existe SOLO para el caso que ejercita; el
-  vocabulario real de Qwen tiene miles de tokens así (los de ~20-30 chars
-  son raros en BPE, por eso el filter los tolera y el pase fino los cubre
-  con costo de 1 re-simulación por step).
+INTENT OF THESE TESTS (in a nutshell):
+- They test the generator with a FakeModel that advances a fixed token
+  sequence (high logits for the next token of the sequence, low for the
+  rest): the argmax picks the target when it is in allowed.
+- HALF of the tests are for the FINE PASS: the gaps the filter lets through
+  by design (abstention on boundary states) MUST be rejected by the
+  char-by-char re-simulation of the winner:
+    * gap 2 residual 2: a token that enters parameters + first key in one
+      token ('", "parameters": {"a') — a valid key passes, an invalid key is
+      blocked (before, the invalid one slipped through).
+    * gap 3: key+value+closing complete in one token (', "b": "x",' with
+      "b": number) — the fine pass blocks it; the filter allowed it.
+    * gap 4: enter AND exit parameters in one token — without all the
+      required keys it is blocked; with all of them, it passes.
+    * exact-duplicate slip ('"a": 4' with "a" already emitted) — blocked.
+    * plan gap: output COMPLETE without going through PARAMS_OBJECT
+      ('}' right after the name) — blocked.
+- Each token in the mock vocab exists ONLY for the case it exercises; the
+  real Qwen vocab has thousands of such tokens (~20-30 chars are rare in
+  BPE, which is why the filter tolerates them and the fine pass covers them
+  at the cost of 1 re-simulation per step).
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from src.decoder.constrained_generator import (
 )
 from src.decoder.schema_validator import SchemaContext
 from src.decoder.state import DecoderPhase, DecoderState
-from src.decoder.trie import build_trie
+from src.decoder.trie import TrieNode, build_trie
 from src.loader.vocab_loader import (
     BYTE_CATEGORY,
     Vocab,
@@ -43,7 +43,7 @@ from src.loader.vocab_loader import (
 )
 from src.models.function_definition import FunctionDef, ParameterDef
 
-# Replica de data/input/functions_definition.json (subset usado en tests).
+# Replica of data/input/functions_definition.json (subset used in tests).
 FUNCTIONS = [
     FunctionDef(
         name="fn_add_numbers",
@@ -70,63 +70,63 @@ FUNCTIONS = [
     ),
 ]
 
-# Vocab mock: id -> texto DECODIFICADO (lo que ve la state machine).
+# Mock vocab: id -> DECODED text (what the state machine sees).
 VOCAB: dict[int, str] = {
-    # Estructura / literales
+    # Structure / literals
     1: "{",
     2: " ",
     3: "}",
     4: ",",
     5: ":",
     6: '"',
-    7: "\n  ",  # newline + indent 2 (formato natural del tramo Opt2)
-    # Keys del output object
+    7: "\n  ",  # newline + indent 2 (natural format of the static span)
+    # Keys of the output object
     10: "name",
     11: "parameters",
-    # Nombres de función
+    # Function names
     20: "fn_",
     27: "fn_add_numbers",
     28: "fn_greet",
     24: "empty",
     29: "fn_empty",
-    # Tokens mixtos estructura+contenido
+    # Mixed structure+content tokens
     30: '": "',
     32: ', "b": 3',
     33: '"a": 2.0',
-    # Keys de parameters
+    # Keys of parameters
     40: '"a"',
     41: '"b"',
-    43: '"a": 4',              # duplicado EXACTO de "a" (slip documentado)
+    43: '"a": 4',              # EXACT duplicate of "a" (documented slip)
     # Values
     50: '"x"',
     51: "2.0",
     52: '"Javier"',
     53: "true",
-    # Keys + estructura
+    # Keys + structure
     70: '"name": ',
     71: '"parameters": {',
     72: ', "parameters": {',
-    # Casos del PASO FINO (Inciso 4.1.1) — tokens multi-fase de ~19-28 chars
-    73: ', "parameters": {"a',       # entra a params + 1ra key "a" (válida)
-    74: ', "parameters": {"zz',      # ídem con key INEXISTENTE (gap 2)
-    75: ', "b": "x",',               # key+value string+cierre para b:number (gap 3)
-    76: ', "b": 4,',                 # ídem con type correcto → pasa el pase fino
-    77: ', "parameters": {"a": 1}',   # entra Y sale de params, falta "b" (gap 4)
-    78: ', "parameters": {"a": 1, "b": 2}',  # ídem con todos los required → pasa
+    # FINE PASS cases — multi-phase tokens of ~19-28 chars
+    73: ', "parameters": {"a',       # enters params + 1st key "a" (valid)
+    74: ', "parameters": {"zz',      # same with a NONEXISTENT key (gap 2)
+    75: ', "b": "x",',               # key+value string+closing for b:number (gap 3)
+    76: ', "b": 4,',                 # same with correct type -> fine pass accepts
+    77: ', "parameters": {"a": 1}',   # enters AND exits params, "b" missing (gap 4)
+    78: ', "parameters": {"a": 1, "b": 2}',  # same with all required keys -> passes
     79: ", ",
-    # Tramos del ORÁCULO (Fase 2): canónicos + value standalone del E2E
-    80: "\n  }\n}",          # T5: cierre de parameters + cierre del ROOT
-    81: "3",                 # value de "b" en el E2E (T4 ya emitió '"b": ')
-    82: "\n}",               # T6: cierre del ROOT (fn_empty, formato INLINE {})
+    # ORACLE spans: canonicals + standalone value of the E2E
+    80: "\n  }\n}",          # T5: closes parameters + closes the ROOT
+    81: "3",                 # value of "b" in the E2E (T4 already emitted '"b": ')
+    82: "\n}",               # T6: closes the ROOT (fn_empty, INLINE {} format)
 }
 
 IDS: dict[str, int] = {text: tid for tid, text in VOCAB.items()}
 
-BYTE_IDS = frozenset()  # este mock no modela tokens <byte>
+BYTE_IDS: frozenset[int] = frozenset()  # this mock does not model <byte> tokens
 
 
 def build_vocab() -> Vocab:
-    """Construye el Vocab mock imitando el indexado de vocab_loader.py."""
+    """Build the mock Vocab mimicking the indexing of vocab_loader.py."""
     id2decoded: dict[int, str] = {}
     starting: dict[str, set[int]] = {}
     for tid, text in VOCAB.items():
@@ -143,70 +143,70 @@ def build_vocab() -> Vocab:
         for phase, phase_chars in _STATIC_PHASE_FIRST_CHARS.items()
     }
     return Vocab(
-        token2id={text: tid for text, tid in VOCAB.items()},
+        token2id={text: tid for tid, text in VOCAB.items()},
         id2token={tid: text for tid, text in VOCAB.items()},
         id2decoded=id2decoded,
         tokens_starting_with=starting,
-        vocab_size=max(VOCAB) + 1,  # ids arbitrarios en el mock: cubrir el máximo
+        vocab_size=max(VOCAB) + 1,  # arbitrary ids in the mock: cover the maximum
         valid_by_phase=valid_by_phase,
     )
 
 
-def make_pipeline() -> tuple[DecoderState, SchemaContext, Vocab, object]:
+def make_pipeline() -> tuple[DecoderState, SchemaContext, Vocab, TrieNode]:
     vocab = build_vocab()
     trie = build_trie([fn.name for fn in FUNCTIONS])
     return DecoderState(), SchemaContext(FUNCTIONS), vocab, trie
 
 
 def step(state: DecoderState, schema: SchemaContext, text: str) -> None:
-    """Avanza el estado con un token y sincroniza el schema (contrato Task 4.1)."""
+    """Advance the state with a token and sync the schema (generator contract)."""
     assert state.update_from_text(text), f"state machine rejected {text!r}"
     schema.update(state)
 
 
 def at_params(
     fn_name: str = "fn_add_numbers",
-) -> tuple[DecoderState, SchemaContext, Vocab, object]:
-    """Estado en VALUE_END tras el name (depth 0, función seleccionada)."""
+) -> tuple[DecoderState, SchemaContext, Vocab, TrieNode]:
+    """State at VALUE_END after the name (depth 0, function selected)."""
     state, schema, vocab, trie = make_pipeline()
     for t in ("{", '"name": ', '"', fn_name, '"'):
         step(state, schema, t)
     return state, schema, vocab, trie
 
 
-def set_params_ctx() -> tuple[DecoderState, SchemaContext, Vocab, object]:
-    """Estado PARAMS_OBJECT con selected_function (fn_add_numbers) y keys ∅."""
+def set_params_ctx() -> tuple[DecoderState, SchemaContext, Vocab, TrieNode]:
+    """State PARAMS_OBJECT with selected_function (fn_add_numbers) and empty keys."""
     state, schema, vocab, trie = at_params("fn_add_numbers")
     step(state, schema, ', "parameters": {')
     return state, schema, vocab, trie
 
 
 class TestFineValidationGap2EnterParamsWithFirstKey:
-    """Inciso 4.1.1: token que entra a parameters + lee la 1ra key (gap 2)."""
+    """Fine pass: token that enters parameters + reads the 1st key (gap 2)."""
 
     def test_valid_first_key_passes(self) -> None:
         state, schema, vocab, trie = at_params("fn_add_numbers")
-        # "a" entra a parameters en el MISMO token que abre el objeto: el
-        # pase fino la valida (antes el filter la dejaba de contrabando).
+        # "a" enters parameters in the SAME token that opens the object: the
+        # fine pass validates it (before, the filter let it slip through).
         assert _passes_fine_validation(FUNCTIONS, schema, state, trie, ', "parameters": {"a')
 
     def test_invalid_first_key_blocked(self) -> None:
         state, schema, vocab, trie = at_params("fn_add_numbers")
-        # "zz" no es prefijo de ninguna key disponible: el prefix check del
-        # paso por carácter lo bloquea (gap 2 residual 2 CERRADO).
+        # "zz" is not a prefix of any available key: the prefix check of the
+        # char-by-char walk blocks it (gap 2 residual 2 CLOSED).
         assert not _passes_fine_validation(
             FUNCTIONS, schema, state, trie, ', "parameters": {"zz'
         )
 
 
 class TestFineValidationGap3CompleteKeyValue:
-    """Inciso 4.1.1: key+value+cierre completos en un token (gap 3)."""
+    """Fine pass: key+value+closing complete in one token (gap 3)."""
 
     def test_wrong_type_blocked(self) -> None:
         state, schema, vocab, trie = set_params_ctx()
-        step(state, schema, '"a": 2.0')  # IN_NUMBER_VALUE, "a" abierta
-        # ', "b": "x",' abre un string para b:number: el COLON intermedio
-        # expone el tipo y el '"' que abre el string se bloquea.
+        step(state, schema, '"a": 2.0')  # IN_NUMBER_VALUE, "a" open
+        # ', "b": "x",' opens a string for b:number: the intermediate COLON
+        # exposes the type and the '"' that opens the string is blocked.
         assert not _passes_fine_validation(FUNCTIONS, schema, state, trie, ', "b": "x",')
 
     def test_right_type_passes(self) -> None:
@@ -216,13 +216,14 @@ class TestFineValidationGap3CompleteKeyValue:
 
 
 class TestFineValidationGap4EnterAndExitParams:
-    """Inciso 4.1.1: entrar Y salir de parameters en un token (gap 4)."""
+    """Fine pass: enter AND exit parameters in one token (gap 4)."""
 
     def test_missing_required_blocked(self) -> None:
         state, schema, vocab, trie = at_params("fn_add_numbers")
-        # El objeto parameters completo en un token (arrancando desde VALUE_END
-        # exige la coma: desde acá solo ',' o '}' son válidos), sin "b": el '}'
-        # de cierre (depth 1→0 intermedio) dispara la cláusula 4 → falta "b".
+        # The whole parameters object in one token (starting from VALUE_END
+        # requires the comma: from here only ',' or '}' are valid), without "b":
+        # the closing '}' (intermediate depth 1->0) triggers clause 4 -> "b"
+        # missing.
         assert not _passes_fine_validation(
             FUNCTIONS, schema, state, trie, ', "parameters": {"a": 1}'
         )
@@ -235,40 +236,39 @@ class TestFineValidationGap4EnterAndExitParams:
 
 
 class TestFineValidationDuplicateSlip:
-    """Inciso 4.1.1: el slip del duplicado exacto se cierra en el pase fino."""
+    """Fine pass: the exact-duplicate slip is closed in the fine pass."""
 
     def test_identical_duplicate_key_blocked(self) -> None:
         state, schema, vocab, trie = set_params_ctx()
         step(state, schema, '"a": 2.0')
-        step(state, schema, ",")  # cierra "a" → PARAMS_OBJECT
-        # El filter lo permitía (slip documentado); el paso por carácter ve
-        # el reset ""→"a" → available ya no contiene "a" → bloqueado.
+        step(state, schema, ",")  # closes "a" -> PARAMS_OBJECT
+        # The filter allowed it (documented slip); the char-by-char walk sees
+        # the reset ""->"a" -> available no longer contains "a" -> blocked.
         assert not _passes_fine_validation(FUNCTIONS, schema, state, trie, '"a": 4')
 
 
 class TestFineValidationMissingParamsObject:
-    """Inciso 4.1.1: COMPLETE sin haber pasado por PARAMS_OBJECT."""
+    """Fine pass: COMPLETE without going through PARAMS_OBJECT."""
 
     def test_close_without_params_object_blocked(self) -> None:
         state, schema, vocab, trie = at_params("fn_empty")
-        # '}' cierra el output object directo: nunca vimos '{' de parameters.
+        # '}' closes the output object directly: we never saw the parameters '{'.
         assert not _passes_fine_validation(FUNCTIONS, schema, state, trie, "}")
 
     def test_full_empty_params_close_passes(self) -> None:
         state, schema, vocab, trie = make_pipeline()
         for t in ("{", '"name": ', '"', "fn_empty", '"', ', "parameters": {'):
             step(state, schema, t)
-        step(state, schema, "}")  # cierra parameters vacío (depth 1→0)
-        assert _passes_fine_validation(FUNCTIONS, schema, state, trie, "}")  # cierra output
+        step(state, schema, "}")  # closes empty parameters (depth 1->0)
+        assert _passes_fine_validation(FUNCTIONS, schema, state, trie, "}")  # closes output
 
 
 class TestFineValidationNameEscapeRejected:
-    """BUG-011 (2026-09-23): un escape dentro del value de "name" no debe
-    poder colarse infinitamente. name_buffer no lo toca (se skippea en
-    state.py), así que sin el guard explícito en _allows_name_value el
-    trie sigue viendo un prefijo válido y el generador nunca cierra el
-    string (repro real: 'Greet shrek' → 200 forwards en '\\n\\t\\t\\t...'
-    sin completar)."""
+    """An escape inside the "name" value must not slip through forever.
+    name_buffer does not touch it (it is skipped in state.py), so without the
+    explicit guard in _allows_name_value the trie keeps seeing a valid prefix
+    and the generator never closes the string (real repro: 'Greet shrek' ->
+    200 forwards on '\\n\\t\\t\\t...' without completing)."""
 
     def test_escape_inside_name_value_blocked(self) -> None:
         state, schema, vocab, trie = make_pipeline()
@@ -284,18 +284,18 @@ class TestFineValidationNameEscapeRejected:
 
 
 class _FakeTensor:
-    """Dummy que REPLICA la forma 2D [1, N] del tensor real de encode().
+    """Dummy that REPLICATES the 2D shape [1, N] of the real encode() tensor.
 
-    BUG-005: Small_LLM_Model.encode() arma torch.tensor([ids]) → 2D; su
-    .tolist() devuelve list[list[int]]. Antes este dummy devolvía una lista
-    PLANA (1D) y el bug de dimensiones pasaba desapercibido en la suite.
+    Small_LLM_Model.encode() builds torch.tensor([ids]) -> 2D; its .tolist()
+    returns list[list[int]]. Before, this dummy returned a FLAT list (1D) and
+    the dimension bug went unnoticed in the suite.
     """
 
     def __init__(self, ids: list[int]) -> None:
         self._ids = ids
 
     def __getitem__(self, idx: int) -> _FakeRow:
-        # t[0] de un tensor 2D [1, N] → vista 1D [N]
+        # t[0] of a 2D tensor [1, N] -> 1D view [N]
         return _FakeRow(self._ids)
 
     def tolist(self) -> list[list[int]]:
@@ -303,7 +303,7 @@ class _FakeTensor:
 
 
 class _FakeRow:
-    """Vista 1D de una fila de tensor (t[0].tolist() → list[int] plano)."""
+    """1D view of a tensor row (t[0].tolist() -> flat list[int])."""
 
     def __init__(self, ids: list[int]) -> None:
         self._ids = ids
@@ -313,13 +313,13 @@ class _FakeRow:
 
 
 class FakeModel:
-    """Mock de Small_LLM_Model: empuja una secuencia fija de tokens.
+    """Mock of Small_LLM_Model: pushes a fixed token sequence.
 
-    encode(prompt) devuelve un único id dummy (prompt_length = 1); cada
-    get_logits_from_input_ids asigna logit alto al siguiente token de la
-    secuencia esperada y -100 al resto. Así el argmax elige el target SOLO
-    si el target está en allowed (de lo contrario elige otro token y la
-    generación se desvía — el test lo detecta).
+    encode(prompt) returns a single dummy id (prompt_length = 1); each
+    get_logits_from_input_ids assigns a high logit to the next token of the
+    expected sequence and -100 to the rest. That way the argmax picks the
+    target ONLY if the target is in allowed (otherwise it picks another token
+    and the generation diverges — the test detects it).
     """
 
     def __init__(self, vocab: Vocab, sequence: list[str]) -> None:
@@ -327,20 +327,20 @@ class FakeModel:
         self._sequence = sequence
 
     def encode(self, text: str) -> _FakeTensor:
-        return _FakeTensor([999])  # prompt dummy de 1 id
+        return _FakeTensor([999])  # dummy 1-id prompt
 
     def decode(self, ids: list[int]) -> str:
         return "".join(self._vocab.id2decoded[tid] for tid in ids)
 
     def get_logits_from_input_ids(self, input_ids: list[int]) -> list[float]:
-        # BUG-005: contrato de FORMAS con el SDK real — get_logits espera
-        # list[int] PLANO. Si generate() dejara de aplanar ([0].tolist()), acá
-        # entraría list[list[int]] y este assert tiñe la suite de rojo.
+        # FORMS contract with the real SDK: get_logits expects a FLAT list[int].
+        # If generate() stopped flattening ([0].tolist()), a list[list[int]]
+        # would arrive here and this assert would paint the suite red.
         assert all(isinstance(x, int) for x in input_ids), (
-            "get_logits_from_input_ids debe recibir list[int] plano, "
-            f"no {type(input_ids[0]).__name__}"
+            "get_logits_from_input_ids must receive a flat list[int], "
+            f"not {type(input_ids[0]).__name__}"
         )
-        step = len(input_ids) - 1  # prompt_length == N del encode
+        step = len(input_ids) - 1  # prompt_length == N of encode
         logits = [-100.0] * self._vocab.vocab_size
         if step < len(self._sequence):
             logits[IDS[self._sequence[step]]] = 100.0
@@ -349,7 +349,7 @@ class FakeModel:
 
 class TestGenerator:
     def test_fn_add_numbers_end_to_end(self) -> None:
-        """Acceptance criteria: prompt → JSON con "fn_add_numbers", éxito."""
+        """Acceptance criteria: prompt -> JSON with "fn_add_numbers", success."""
         vocab = build_vocab()
         trie = build_trie([fn.name for fn in FUNCTIONS])
         model = FakeModel(
@@ -380,53 +380,53 @@ class TestGenerator:
         assert generated == ""
 
     def test_garbage_target_is_replaced_by_second_best(self) -> None:
-        """Si el target del modelo NO está permitido, se genera igual un
-        token válido (argmax sobre allowed) o se corta — nunca JSON roto."""
+        """If the model's target is NOT allowed, a valid token is still
+        generated (argmax over allowed) or it stops — never broken JSON."""
         vocab = build_vocab()
         trie = build_trie([fn.name for fn in FUNCTIONS])
-        # Target "fn_" en ROOT: no permitido (solo '{' y ws) → se elige '{'.
+        # Target "fn_" at ROOT: not allowed (only '{' and ws) -> '{' is picked.
         model = FakeModel(vocab, ["fn_"])
         generated, ok = generate(model, "boo", vocab, FUNCTIONS, trie, max_tokens=3)
-        assert not ok  # sin COMPLETE en 3 tokens
-        assert generated.startswith("{")  # el token ganador fue el '{'
+        assert not ok  # no COMPLETE within 3 tokens
+        assert generated.startswith("{")  # the winning token was '{'
 
     def test_n_token_prompt_does_not_leak_into_generated(self) -> None:
-        """BUG-005 (regresión): el prompt de N tokens NO se cuela en el output.
+        """Regression: an N-token prompt does NOT leak into the output.
 
-        encode() devuelve tensor 2D con ids que NO existen en el vocab del
-        test (999/777/555). Si generated_ids incluyera tokens del prompt (por
-        prompt_length mal calculado), FakeModel.decode haría KeyError — fallo
-        ruidoso. Con el fix, prompt_length == 3 y generated solo tiene '{'.
+        encode() returns a 2D tensor with ids that do NOT exist in the test
+        vocab (999/777/555). If generated_ids included prompt tokens (wrong
+        prompt_length), FakeModel.decode would raise KeyError — a noisy
+        failure. With the fix, prompt_length == 3 and generated only has '{'.
         """
         vocab = build_vocab()
         trie = build_trie([fn.name for fn in FUNCTIONS])
 
         class _PromptfulModel(FakeModel):
-            """encode() de 3 tokens — ninguno existe en VOCAB (KeyError si
-            alguno llegara a generated_ids)."""
+            """encode() of 3 tokens — none exists in VOCAB (KeyError if any
+            reached generated_ids)."""
 
             def encode(self, text: str) -> _FakeTensor:  # noqa: D102
                 return _FakeTensor([999, 777, 555])
 
         generated, ok = generate(
             _PromptfulModel(vocab, ["{"]),
-            "prompt largo", vocab, FUNCTIONS, trie, max_tokens=1,
+            "long prompt", vocab, FUNCTIONS, trie, max_tokens=1,
         )
-        assert not ok  # solo 1 token generado: sin COMPLETE
-        # El único token generado fue '{' (id 1): nada de prompt en el output.
+        assert not ok  # only 1 token generated: no COMPLETE
+        # The only generated token was '{' (id 1): no prompt in the output.
         assert generated == "{"
 
 
-# ─── Fase 2: oráculo por estado (tramos estáticos Nivel 1, Anexo 25/09) ──
-# _get_next_static_text(state, schema, generated_text) recorre
-# _STATIC_TEXT_RULES (T1-T6, funciones
-# PURAS) y devuelve el canónico del primer dominio que matchea, alineado al
-# ws final de emitted (E). Estos tests verifican:
-#   * el canónico de CADA tramo (tabla Nivel 1 del Anexo);
-#   * los dominios DISJUNTOS (N gate verificado contra state.py) — BUG-013;
-#   * el alineamiento E (clase BUG-012: nunca duplicar ws);
-#   * el estado post-inyección con state.simulate(C) como fuente de verdad
-#     (dec. 25/09: NO tablas escritas a mano — desync con state.py es bug).
+# ─── Oracle by state (level-1 static spans) ───────────────────────────────
+# _get_next_static_text(state, schema, generated_text) walks
+# _STATIC_TEXT_RULES (T1-T6, PURE functions) and returns the canonical of the
+# first matching domain, aligned to emitted's trailing ws (E). These tests
+# verify:
+#   * the canonical of EACH span;
+#   * the DISJOINT domains (N gate verified against state.py);
+#   * the E alignment (never duplicate ws);
+#   * the post-injection state with state.simulate(C) as the source of truth
+#     (NO hand-written tables — a desync with state.py is a bug).
 
 T1_CANON_ADD = ',\n  "parameters": {\n    "a": '
 T1_CANON_GREET = ',\n  "parameters": {\n    "name": "'
@@ -437,11 +437,11 @@ T4_CANON_NEXT = ',\n    "b": '
 T5_CANON = "\n  }\n}"
 T6_CANON = "\n}"
 
-# Canónicos viejos (tramo lineal de Opt2) — SOLO pueden venir del oráculo.
+# Old canonicals (linear span) — they can ONLY come from the oracle.
 _OLD_TAIL = ',\n  "parameters": {'
 
-# id2decoded del vocab mock (split elegido para el test; el encode real de
-# Qwen produce su propio split y el best-effort lo maneja igual).
+# id2decoded of the mock vocab (split chosen for the test; the real Qwen
+# encode produces its own split and best-effort handles it anyway).
 _ORACLE_IDS: dict[str, list[int]] = {
     T1_CANON_ADD: [4, 7, 71, 7, 2, 2, 40, 5, 2],
     T3_CANON_NEXT: [7, 2, 2, 41, 5, 2],
@@ -452,49 +452,48 @@ _ORACLE_IDS: dict[str, list[int]] = {
 
 
 class TestLevel1Oracle:
-    """Tabla Nivel 1: cada tramo responde SU canónico desde su dominio."""
+    """Level-1 table: each span answers ITS canonical from its domain."""
 
     def test_t1_post_name_value_end(self) -> None:
-        # Nominal: value de "name" cerrado → VALUE_END d0, N=1 → la coma +
-        # apertura de parameters + la PRIMERA key (fusión T1+ENTRY(K1)).
+        # Nominal: "name" value closed -> VALUE_END d0, N=1 -> comma +
+        # parameters opening + the FIRST key (fusion T1+ENTRY(K1)).
         state, schema, _vocab, _trie = at_params("fn_add_numbers")
         assert state.phase is DecoderPhase.VALUE_END and state.depth == 0
         assert _get_next_static_text(state, schema, "") == T1_CANON_ADD
 
     def test_t1_string_param_opens_with_quote(self) -> None:
-        # fn_greet: su ÚNICO param es "name" de tipo string → OP(k)='"'.
-        # (El param se llama igual que la key del output object: N=1 sigue
-        # valiendo porque es el VALUE_END d0 — el param vive a depth 1.)
+        # fn_greet: its ONLY param is "name" of type string -> OP(k)='"'.
+        # (The param has the same name as the output object key: N=1 still
+        # holds because it is the d0 VALUE_END — the param lives at depth 1.)
         state, schema, _vocab, _trie = at_params("fn_greet")
         assert _get_next_static_text(state, schema, "") == T1_CANON_GREET
 
     def test_t2_fused_comma_token(self) -> None:
-        # Token BPE fusionado ('fn_add_numbers",') → IN_OBJECT directo (sin
-        # pasar por VALUE_END): T2 cubre el salto (N=1 se mantiene).
+        # Fused BPE token ('fn_add_numbers",') -> IN_OBJECT directly (without
+        # going through VALUE_END): T2 covers the jump (N=1 holds).
         state, schema, _vocab, _trie = at_params("fn_add_numbers")
         step(state, schema, ",")
         assert state.phase is DecoderPhase.IN_OBJECT
         assert _get_next_static_text(state, schema, "") == T2_CANON_ADD
 
     def test_empty_params_return_none(self) -> None:
-        # DECISIÓN 25/09 (tramo gratis): ord=∅ → T1/T2 devuelven None — el
-        # modelo genera "parameters": {} con su token FUSIONADO (tid 6257);
-        # inyectar '{' suelto sería una costura tipo BUG-012. fn_empty es
-        # el único caso del subject; el probe real confirmó el formato
-        # INLINE {}.
+        # Free span: ord=∅ -> T1/T2 return None — the model generates
+        # "parameters": {} with its FUSED token (tid 6257); injecting a loose
+        # '{' would be a seam-type defect. fn_empty is the only case in the
+        # subject; the real probe confirmed the INLINE {} format.
         state, schema, _vocab, _trie = at_params("fn_empty")
         assert _get_next_static_text(state, schema, "") is None
 
     def test_t3_first_required_key(self) -> None:
-        # PARAMS_OBJECT d1 con keys pendientes → ENTRY(Knext).
+        # PARAMS_OBJECT d1 with pending keys -> ENTRY(Knext).
         state, schema, _vocab, _trie = set_params_ctx()
         assert _get_next_static_text(state, schema, "") == T3_CANON_FIRST
 
     def test_t3_after_comma(self) -> None:
-        # El modelo emitió la coma tras "a" → PARAMS_OBJECT otra vez (en este
-        # decoder VALUE_END + ',' → PARAMS_OBJECT, NO IN_OBJECT) → T3 da la
-        # SIGUIENTE key requerida. Este es el flujo de los values NUMBER:
-        # IN_NUMBER_VALUE (número abierto) → la coma del modelo → T3.
+        # The model emitted the comma after "a" -> PARAMS_OBJECT again (in this
+        # decoder VALUE_END + ',' -> PARAMS_OBJECT, NOT IN_OBJECT) -> T3 gives
+        # the NEXT required key. This is the flow of NUMBER values:
+        # IN_NUMBER_VALUE (open number) -> the model pays the comma -> T3.
         state, schema, _vocab, _trie = set_params_ctx()
         step(state, schema, '"a": 2.0')
         step(state, schema, ",")
@@ -502,9 +501,9 @@ class TestLevel1Oracle:
         assert _get_next_static_text(state, schema, "") == T3_CANON_NEXT
 
     def test_t4_next_key_after_string_value(self) -> None:
-        # VALUE_END d1 con pendientes → coma + próxima key. Solo un value
-        # que CIERRA en su token llega a VALUE_END d1 (string); un number
-        # deja IN_NUMBER_VALUE y el flujo retoma en T3 tras la coma.
+        # VALUE_END d1 with pending keys -> comma + next key. Only a value that
+        # CLOSES in its token reaches VALUE_END d1 (string); a number leaves
+        # IN_NUMBER_VALUE and the flow resumes at T3 after the comma.
         fn = FunctionDef(
             name="fn_text",
             description="",
@@ -518,13 +517,13 @@ class TestLevel1Oracle:
         schema = SchemaContext([fn])
         for t in ("{", '"name": ', '"', "fn_text", '"', ', "parameters": {'):
             step(state, schema, t)
-        step(state, schema, '"x": "Javier"')  # cierra string → VALUE_END d1
+        step(state, schema, '"x": "Javier"')  # closes string -> VALUE_END d1
         assert state.phase is DecoderPhase.VALUE_END and state.depth == 1
         assert _get_next_static_text(state, schema, "") == ',\n    "y": "'
 
     def test_t5_close_after_last_string_value(self) -> None:
-        # VALUE_END d1 sin pendientes → cierre de parameters + del ROOT.
-        # fn_greet: su ÚNICO param es string → el cierre lo da T5.
+        # VALUE_END d1 with no pending keys -> closes parameters + the ROOT.
+        # fn_greet: its ONLY param is string -> T5 gives the close.
         state, schema, _vocab, _trie = at_params("fn_greet")
         step(state, schema, ', "parameters": {')
         step(state, schema, '"name": ')
@@ -533,9 +532,9 @@ class TestLevel1Oracle:
         assert _get_next_static_text(state, schema, "") == T5_CANON
 
     def test_t6_close_root_after_empty_params(self) -> None:
-        # fn_empty: tras el '}' del parameters vacío (formato INLINE del
-        # probe real) el ROOT queda por cerrar. Sin T6 el modelo debe
-        # emitir ese '}' por forward (probe: SUCCESS=False). T6 lo da.
+        # fn_empty: after the '}' of empty parameters (INLINE format of the
+        # real probe) the ROOT is still to close. Without T6 the model must
+        # emit that '}' by forward (probe: SUCCESS=False). T6 gives it.
         state, schema, _vocab, _trie = at_params("fn_empty")
         step(state, schema, ', "parameters": {')
         step(state, schema, "}")
@@ -543,42 +542,42 @@ class TestLevel1Oracle:
         assert _get_next_static_text(state, schema, "") == T6_CANON
 
     def test_t6_close_root_after_full_params(self) -> None:
-        # Post-parameters con todas las keys: VALUE_END d0, N=0 (current_key
-        # es la última key de params, no "name"), ρ=0, P=1 → cierre del ROOT.
+        # Post-parameters with all keys: VALUE_END d0, N=0 (current_key is the
+        # last params key, not "name"), ρ=0, P=1 -> closes the ROOT.
         state, schema, _vocab, _trie = set_params_ctx()
         step(state, schema, '"a": 2.0')
         step(state, schema, ', "b": 3')
-        step(state, schema, "}")  # cierra parameters → d0
+        step(state, schema, "}")  # closes parameters -> d0
         assert state.phase is DecoderPhase.VALUE_END and state.depth == 0
         assert _get_next_static_text(state, schema, "") == T6_CANON
 
     def test_t6_blocked_while_name_open(self) -> None:
-        # N=1 (post-name, parameters aún sin abrir) → T6 None: el ROOT NO
-        # se cierra sin parameters (el pase fino lo bloquea si el modelo lo
-        # intentara por forward). fn_empty en VALUE_END post-name: T1 ya
-        # dio None (ord=∅) y T6 exige N=0 → None total → sigue por forward.
+        # N=1 (post-name, parameters not yet open) -> T6 None: the ROOT does
+        # NOT close without parameters (the fine pass blocks it if the model
+        # tried by forward). fn_empty at VALUE_END post-name: T1 already gave
+        # None (ord=∅) and T6 requires N=0 -> all None -> continues by forward.
         state, schema, _vocab, _trie = at_params("fn_empty")
         assert _get_next_static_text(state, schema, "") is None
 
     def test_t6_fused_empty_params_token(self) -> None:
-        # HALLazgo del probe real (25/09): el token FUSIONADO ', "parameters":
-        # {}' trae '{'+'}' en UN tocho → has_seen_params_object() queda False
-        # (el schema.update corre POST-token y nunca ve el PARAMS_OBJECT
-        # intermedio). P NO puede gatear T6 — con N=0 ∧ ρ=0 el ROOT solo
-        # puede cerrarse (el pase fino del camino normal cubre el flanco).
+        # Finding of the real probe: the FUSED token ', "parameters": {}'
+        # brings '{'+'}' in ONE chunk -> has_seen_params_object() stays False
+        # (schema.update runs POST-token and never sees the intermediate
+        # PARAMS_OBJECT). P cannot gate T6 — with N=0 ∧ ρ=0 the ROOT can only
+        # be closed (the fine pass of the normal path covers the edge).
         state, schema, _vocab, _trie = at_params("fn_empty")
         step(state, schema, ', "parameters": {}')
         assert state.phase is DecoderPhase.VALUE_END and state.depth == 0
-        assert not schema.has_seen_params_object()  # el flag NO vio el '{'
+        assert not schema.has_seen_params_object()  # the flag did NOT see the '{'
         assert _get_next_static_text(state, schema, "") == T6_CANON
 
     def test_bug013_inner_param_name_not_an_opener(self) -> None:
-        # BUG-013 (regresión): el param interno "name" de fn_greet (depth 1)
-        # NO dispara T1/T2 (los tramos de APERTURA exigen N=1: depth==0 ∧
-        # keys_enclosed==∅ — al cerrar el param, keys_enclosed={'name'}). Y
-        # como es el ÚNICO param, ρ=0 → T5 sí responde (el objeto queda
-        # COMPLETO y hay que cerrarlo): el oráculo NUNCA duplica el tramo
-        # de apertura — esa era la clase de bug del trigger viejo.
+        # Regression: the inner "name" param of fn_greet (depth 1) does NOT
+        # trigger T1/T2 (the OPENING spans require N=1: depth==0 ∧
+        # keys_enclosed==∅ — on closing the param, keys_enclosed={'name'}).
+        # And since it is the ONLY param, ρ=0 -> T5 does answer (the object is
+        # COMPLETE and must be closed): the oracle NEVER duplicates the opening
+        # span — that was the bug class of the old trigger.
         state, schema, _vocab, _trie = at_params("fn_greet")
         step(state, schema, ', "parameters": {')
         step(state, schema, '"name": ')
@@ -591,8 +590,9 @@ class TestLevel1Oracle:
         assert _get_next_static_text(state, schema, "") is None
 
     def test_insertion_order_of_parameters(self) -> None:
-        # ord = tuple(F.parameters): el orden JSON es el del dict (insertion
-        # order), NO alphabetical — "b" declarada primero sale primero.
+        # ord = tuple(F.parameters): the JSON order is the dict order
+        # (insertion order), NOT alphabetical — "b" declared first comes out
+        # first.
         fn = FunctionDef(
             name="fn_ordered",
             description="",
@@ -609,44 +609,45 @@ class TestLevel1Oracle:
         assert _get_next_static_text(state, schema, "") == ',\n  "parameters": {\n    "b": '
 
     def test_align_trims_emitted_ws(self) -> None:
-        # E: si emitted ya termina en el ws del canónico (el modelo lo puso),
-        # el tramo NO lo duplica (clase BUG-012) → inyecta solo el resto.
-        # T5 con emitted='\n  ' → e='\n  ' → resta '}\n}'. El 1er char de
-        # emitted es parte del canon T5 → el modelo YA está donde el tramo.
+        # E: if emitted already ends in the canonical's ws (the model put it),
+        # the span does NOT duplicate it (never duplicate ws) -> injects only
+        # the rest. T5 with emitted='\n  ' -> e='\n  ' -> subtracts '}\n}'.
+        # The 1st char of emitted is part of the T5 canon -> the model is
+        # ALREADY where the span is.
         state, schema, _vocab, _trie = at_params("fn_greet")
         step(state, schema, ', "parameters": {')
         step(state, schema, '"name": ')
-        step(state, schema, '"x"')  # único param (string): ρ=0 → VALUE_END d1
+        step(state, schema, '"x"')  # only param (string): ρ=0 -> VALUE_END d1
         assert _get_next_static_text(state, schema, "\n  ") == "}\n}"
 
     def test_t2_aligns_fused_comma_indent(self) -> None:
-        # El token fusionado '",\n  ' (coma + indent del modelo en UN token)
-        # deja IN_OBJECT d0 N=1 con emitted=',\n  ' → T2 alinea y corta el
-        # '\n  ' del canónico: inyecta SOLO '"parameters": {\n    "a": '.
+        # The fused token '",\n  ' (comma + model indent in ONE token) leaves
+        # IN_OBJECT d0 N=1 with emitted=',\n  ' -> T2 aligns and trims the
+        # '\n  ' of the canonical: injects ONLY '"parameters": {\n    "a": '.
         state, schema, _vocab, _trie = at_params("fn_add_numbers")
-        step(state, schema, ",")  # IN_OBJECT d0 (el ',' no resetea la key)
+        step(state, schema, ",")  # IN_OBJECT d0 (the ',' does not reset the key)
         assert state.phase is DecoderPhase.IN_OBJECT and state.depth == 0
         assert _get_next_static_text(state, schema, ",\n  ") == (
             '"parameters": {\n    "a": '
         )
 
     def test_align_unmatchable_ws_falls_to_forward(self) -> None:
-        # emitted termina en ws que NO es prefijo del canónico (p.ej. el
-        # modelo ya emitió la indent de IN_OBJECT y viene la coma del T1):
-        # alineamiento imposible → None → forward normal (seguro, sin
-        # forzar tramos — Riesgo 2 cubierto por diseño).
+        # emitted ends in ws that is NOT a prefix of the canonical (e.g. the
+        # model already emitted the IN_OBJECT indent and the T1 comma is next):
+        # alignment impossible -> None -> normal forward (safe, without forcing
+        # spans).
         state, schema, _vocab, _trie = at_params("fn_add_numbers")
         assert _get_next_static_text(state, schema, "\n  ") is None
 
 
 class TestOracleDomainDisjunction:
-    """Los dominios de los tramos son disjuntos por construcción (phase ×
-    depth × gates): para un estado dado, UN solo tramo responde. Estos pares
-    son los que compartían fase y solo se distinguen por los gates."""
+    """The span domains are disjoint by construction (phase × depth × gates):
+    for a given state, ONE span answers. These are the pairs that shared a
+    phase and are distinguished only by the gates."""
 
     def test_t1_vs_t6_same_phase_different_gate(self) -> None:
-        # VALUE_END d0: T1 responde SOLO con N=1 (post-name, params por
-        # abrir); T6 SOLO con N=0 ∧ ρ=0 ∧ P=1 (post-parameters).
+        # VALUE_END d0: T1 answers ONLY with N=1 (post-name, params to open);
+        # T6 ONLY with N=0 ∧ ρ=0 ∧ P=1 (post-parameters).
         state, schema, _vocab, _trie = at_params("fn_add_numbers")
         assert _get_next_static_text(state, schema, "") == T1_CANON_ADD
         state2, schema2, _v2, _t2 = set_params_ctx()
@@ -656,20 +657,20 @@ class TestOracleDomainDisjunction:
         assert _get_next_static_text(state2, schema2, "") == T6_CANON
 
     def test_t3_vs_t6_pending_keys_gate(self) -> None:
-        # PARAMS_OBJECT d1 es T3 (ρ=1); con ρ=0 no matchea T3 → si el cierre
-        # viene por el modelo, T6 lo complementa solo en d0.
+        # PARAMS_OBJECT d1 is T3 (ρ=1); with ρ=0 it does not match T3 -> if the
+        # close comes from the model, T6 complements it only at d0.
         state, schema, _vocab, _trie = set_params_ctx()
         assert _get_next_static_text(state, schema, "") == T3_CANON_FIRST
 
 
 class TailFakeModel(FakeModel):
-    """FakeModel cuyo encode() tokeniza SOLO los canónicos del oráculo.
+    """FakeModel whose encode() tokenizes ONLY the oracle canonicals.
 
-    El prompt y el STATIC_HEADER (header 1) devuelven el id dummy 999 como el
-    FakeModel base — 999 no existe en el id2decoded del vocab mock, así que
-    el header 1 nunca se inyecta (mismo comportamiento que los tests
-    existentes). Los canónicos _ORACLE_IDS se devuelven con ids del vocab
-    mock para poder inyectarlos por el mismo camino que en producción.
+    The prompt and the STATIC_HEADER (header 1) return the dummy id 999 like
+    the base FakeModel — 999 does not exist in the mock vocab id2decoded, so
+    header 1 is never injected (same behavior as the existing tests). The
+    _ORACLE_IDS canonicals are returned with mock vocab ids so they can be
+    injected through the same path as in production.
     """
 
     def __init__(self, vocab: Vocab, sequence: list[str]) -> None:
@@ -687,10 +688,9 @@ class TailFakeModel(FakeModel):
 
 
 class TestInjectOracleText:
-    """_commit_static_text con un canónico del oráculo: el estado post
-    debe coincidir EXACTO con state.simulate(C) (fuente de verdad — dec.
-    25/09; una tabla escrita a mano desincronizada con state.py sería un
-    bug silencioso)."""
+    """_commit_static_text with an oracle canonical: the post state must match
+    EXACTLY state.simulate(C) (source of truth; a hand-written table desynced
+    with state.py would be a silent bug)."""
 
     def _state_tuple(self, s: DecoderState) -> tuple[object, object, object, object]:
         return (s.phase, s.depth, s.current_key, s.keys_enclosed)
@@ -704,10 +704,10 @@ class TestInjectOracleText:
             T1_CANON_ADD, model, vocab, ids, state, schema, emitted
         )
         assert ids == _ORACLE_IDS[T1_CANON_ADD]
-        _ok, sim = state.simulate(T1_CANON_ADD)  # fuente de verdad
+        _ok, sim = state.simulate(T1_CANON_ADD)  # source of truth
         assert self._state_tuple(state) == self._state_tuple(sim)
-        # COLON d1 esperando el value numérico de "a" — el canónico terminó
-        # en ' ' (la apertura del value de un number NO lleva comilla).
+        # COLON d1 waiting for the numeric value of "a" — the canonical ended
+        # in ' ' (the value opening of a number carries no quote).
         assert state.phase is DecoderPhase.COLON and state.depth == 1
         assert "".join(emitted) == T1_CANON_ADD
 
@@ -723,10 +723,11 @@ class TestInjectOracleText:
         assert state.phase is DecoderPhase.COMPLETE
 
     def test_inject_returns_false_without_advance(self) -> None:
-        # encode() solo entiende canónicos del oráculo: un texto fuera del
-        # registro → id 999 no existe → la inyección no avanza → False (el
-        # caller cae al camino normal; sin este contrato, un continue ciego
-        # tras la falla re-matchearía el mismo tramo → loop infinito).
+        # encode() only understands oracle canonicals: a text outside the
+        # registry -> id 999 does not exist -> injection does not advance ->
+        # False (the caller falls back to the normal path; without this
+        # contract, a blind continue after the failure would re-match the same
+        # span -> infinite loop).
         state, schema, vocab, _trie = at_params("fn_add_numbers")
         model = FakeModel(vocab, [])
         ids: list[int] = []
@@ -739,27 +740,27 @@ class TestInjectOracleText:
 
 
 class TestOracleEndToEnd:
-    """Oráculo end-to-end: los canónicos se inyectan sin forwards.
+    """Oracle end-to-end: canonicals are injected without forwards.
 
-    La secuencia del modelo NO contiene los chars de los canónicos ('\n
-    "parameters": {\n    "a": ' no existe como texto en ninguna entrada del
-    vocab): si aparecen en el output, SOLO pudieron venir de la inyección.
-    Los placeholders (" ") ocupan los índices que cada canónico consume sin
-    forward (el FakeModel indexa el step por len(input_ids)). Cada test fija
-    el conteo EXACTO de forwards: una regresión (tramo que no matchea, que
-    duplica ws, o que se cae al forward) desvía la secuencia o cambia calls.
+    The model sequence does NOT contain the canonical chars ('\n
+    "parameters": {\n    "a": ' does not exist as text in any vocab entry): if
+    they appear in the output, they could ONLY have come from the injection.
+    The placeholders (" ") occupy the indices each canonical consumes without a
+    forward (FakeModel indexes the step by len(input_ids)). Each test fixes the
+    EXACT forward count: a regression (a span that does not match, duplicates
+    ws, or falls back to forward) diverts the sequence or changes calls.
     """
 
     def test_fn_add_numbers_full_oracle(self) -> None:
-        """T1 + T3 + T6 consumidos; el modelo paga 9 forwards (5 name +
-        '2.0', ',', '3', '}'). El flujo number real: '2.0' deja
-        IN_NUMBER_VALUE (número abierto) → el modelo paga la coma → T3 da
-        el ws + '"b": ' → '3' abierto → el modelo paga el '}' de cierre de
-        parameters → T6 da el '\n}' del ROOT."""
+        """T1 + T3 + T6 consumed; the model pays 9 forwards (5 name + '2.0',
+        ',', '3', '}'). The real number flow: '2.0' leaves IN_NUMBER_VALUE
+        (open number) -> the model pays the comma -> T3 gives the ws + '"b": '
+        -> '3' open -> the model pays the closing '}' of parameters -> T6 gives
+        the ROOT '\n}'."""
         vocab = build_vocab()
         trie = build_trie([fn.name for fn in FUNCTIONS])
-        # 5 name + 9 placeholders (T1: 9 ids) + '2.0' + ',' + 6
-        # placeholders (T3: 6 ids) + '3' + '}' (T6 cierra sin forward).
+        # 5 name + 9 placeholders (T1: 9 ids) + '2.0' + ',' + 6 placeholders
+        # (T3: 6 ids) + '3' + '}' (T6 closes without forward).
         model = TailFakeModel(
             vocab,
             [
@@ -773,14 +774,14 @@ class TestOracleEndToEnd:
         generated, ok = generate(model, "What is 2+3?", vocab, FUNCTIONS, trie)
         assert ok
         assert T1_CANON_ADD in generated
-        assert T3_CANON_NEXT in generated  # ',\n    "b": ' en la salida real
-        assert generated.endswith(T6_CANON)  # el '\n}' de cierre del ROOT
+        assert T3_CANON_NEXT in generated  # ',\n    "b": ' in the real output
+        assert generated.endswith(T6_CANON)  # the closing ROOT '\n}'
         assert model.calls == 9
 
     def test_fn_empty_gets_root_close(self) -> None:
-        """fn_empty: ord=∅ → T1 None → el modelo emite ',
-        "parameters": {}' por forward; T6 da el '\n}' que faltaba (probe
-        real: SUCCESS=False por ese cierre)."""
+        """fn_empty: ord=∅ -> T1 None -> the model emits ',
+        "parameters": {}' by forward; T6 gives the missing '\n}' (real probe:
+        SUCCESS=False because of that close)."""
         vocab = build_vocab()
         trie = build_trie([fn.name for fn in FUNCTIONS])
         model = TailFakeModel(
@@ -792,19 +793,19 @@ class TestOracleEndToEnd:
         )
         generated, ok = generate(model, "hi", vocab, FUNCTIONS, trie)
         assert ok
-        # Formato INLINE real de Qwen para parameters vacío ('{"' directo,
-        # probe_fn_empty 24/09): T6 aporta el '\n}' que cerró el ROOT.
+        # Real Qwen INLINE format for empty parameters ('{"' directly):
+        # T6 contributes the '\n}' that closed the ROOT.
         assert generated.endswith('"fn_empty", "parameters": {}\n}')
-        assert model.calls == 7  # 5 name + '{'+'}' de parameters (T6 gratis)
+        assert model.calls == 7  # 5 name + parameters '{'+'}' (T6 free)
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# number == float: la otra mitad del fix (la que NO es SchemaContext)
+# number == float: the other half of the fix (the one that is NOT SchemaContext)
 # ─────────────────────────────────────────────────────────────────────────
 
-#: Definición PRIVADA que mezcla number e integer en la MISMA llamada: es
-#: donde un fix laxo se delata (si el decimal se acepta para cualquiera de los
-#: dos, el `isinstance` de la moulinette revienta).
+#: PRIVATE definition that mixes number and integer in the SAME call: this is
+#: where a lax fix shows itself (if the decimal is accepted for either of the
+#: two, the grader's `isinstance` blows up).
 MIXED_FUNCTIONS = [
     FunctionDef(
         name="fn_calc",
@@ -817,18 +818,18 @@ MIXED_FUNCTIONS = [
     ),
 ]
 
-#: Id sintético para ".0" (el vocab mock compartido no lo trae y NO se toca:
-#: agregarlo al VOCAB global cambiaría `starting["."]` y
-#: `valid_by_phase` para todos los tests de pase fino).
+#: Synthetic id for ".0" (the shared mock vocab does not have it and is NOT
+#: touched: adding it to the global VOCAB would change `starting["."]` and
+#: `valid_by_phase` for all fine-pass tests).
 TAIL_ID = 200
 
 
 class FloatTailModel:
-    """Fake que sólo sabe tokenizar el tail ".0" (lo que inyecta el fix)."""
+    """Fake that only knows how to tokenize the tail ".0" (what the fix injects)."""
 
     def __init__(self, vocab: Vocab) -> None:
         self._vocab = vocab
-        # Patch local del vocab de ESTE test (el mock es por-test).
+        # Local vocab patch for THIS test (the mock is per-test).
         vocab.id2decoded[TAIL_ID] = ".0"
         vocab.id2token[TAIL_ID] = ".0"
         vocab.token2id[".0"] = TAIL_ID
@@ -843,7 +844,7 @@ class FloatTailModel:
 def _at_number(
     key: str, buffer: str, functions: list[FunctionDef] = MIXED_FUNCTIONS
 ) -> tuple[DecoderState, SchemaContext]:
-    """Estado real en IN_NUMBER_VALUE con ``buffer`` ya commiteado en el param."""
+    """Real state at IN_NUMBER_VALUE with ``buffer`` already committed in the param."""
     state = DecoderState()
     schema = SchemaContext(functions)
     prefix = (
@@ -857,15 +858,15 @@ def _at_number(
 
 
 class TestFloatTailTrigger:
-    """`_float_tail` devuelve '.0' SÓLO cuando hay que volver float un integer.
+    """`_float_tail` returns '.0' ONLY when an integer must be turned to float.
 
-    POR QUÉ EXISTE ESTA MITAD: la moulinette corre `assert isinstance(a, float)`
-    para un parámetro "number" — `2` da 0 puntos. No se puede dejar la
-    corrección a la frontera de salida (output_validator) porque `2` y `2.0` son
-    SECUENCIAS DE TOKENS DISTINTAS: el decoder ya las emitió, y '2.0' != '2' es
-    un string distinto. La forma del literal tiene que garantizarse durante la
-    decodificación; el DÓNDE (SchemaContext para `integer`, generator para
-    `number`) lo fija la arquitectura, no el capricho.
+    WHY THIS HALF EXISTS: the grader runs `assert isinstance(a, float)` for a
+    "number" param — `2` scores 0 points. The correction cannot be left to the
+    output boundary (output_validator) because `2` and `2.0` are DIFFERENT
+    TOKEN SEQUENCES: the decoder already emitted them, and '2.0' != '2' is a
+    different string. The literal's shape must be guaranteed during decoding;
+    the WHERE (SchemaContext for `integer`, generator for `number`) is fixed by
+    the architecture, not by whim.
     """
 
     def test_fires_on_comma_closer(self) -> None:
@@ -877,7 +878,7 @@ class TestFloatTailTrigger:
         assert _float_tail(state, schema, "}") == ".0"
 
     def test_fires_on_whitespace_closer(self) -> None:
-        """El ws es terminador válido: '2 }' también cierra el valor."""
+        """ws is a valid terminator: '2 }' also closes the value."""
         state, schema = _at_number("principal", "2")
         assert _float_tail(state, schema, " }") == ".0"
 
@@ -886,8 +887,8 @@ class TestFloatTailTrigger:
         assert _float_tail(state, schema, ",") == ".0"
 
     def test_injection_lands_before_the_closer(self) -> None:
-        """End-to-end del helper: tras inyectar, el buffer es un float y el
-        estado SIGUE en IN_NUMBER_VALUE, listo para recibir el cierre."""
+        """End-to-end of the helper: after injecting, the buffer is a float and
+        the state REMAINS at IN_NUMBER_VALUE, ready to receive the close."""
         vocab = build_vocab()
         state, schema = _at_number("principal", "2")
         ids: list[int] = []
@@ -897,51 +898,50 @@ class TestFloatTailTrigger:
         assert state.number_buffer == "2.0", state.number_buffer
         assert state.phase is DecoderPhase.IN_NUMBER_VALUE
         assert emitted == [".0"], emitted
-        # Recién ahora el cierre es válido (antes, "2," no cerraba un float).
+        # Only now the close is valid (before, "2," did not close a float).
         assert state.update_from_text(",")
 
 
 class TestFloatTailNoTrigger:
-    """Todo lo que NO debe disparar la inyección.
+    """Everything that must NOT trigger the injection.
 
-    Cada caso es un modo de fallo propio: si alguno disparara, estaríamos
-    CORRIENDO un valor (2.5 -> 2.5.0) o tocando un parámetro que no
-    corresponde.
+    Each case is its own failure mode: if any triggered, we would be CORRUPTING
+    a value (2.5 -> 2.5.0) or touching a parameter that does not correspond.
     """
 
     def test_no_trigger_on_integer_param(self) -> None:
-        """Un "integer" NO se toca: coercionar 4 a 4.0 rompe el assert."""
+        """An "integer" is NOT touched: coercing 4 to 4.0 breaks the assert."""
         state, schema = _at_number("years", "4")
         assert _float_tail(state, schema, ",") is None
 
     def test_no_trigger_when_fraction_already_present(self) -> None:
-        """'2.5' ya es float: inyectar produciría '2.5.0' (JSON inválido)."""
+        """'2.5' is already float: injecting would produce '2.5.0' (invalid JSON)."""
         state, schema = _at_number("principal", "2.5")
         assert _float_tail(state, schema, ",") is None
 
     def test_no_trigger_on_exponent(self) -> None:
-        """'1e3' es un float de Python: no le falta nada."""
+        """'1e3' is a Python float: nothing is missing."""
         state, schema = _at_number("principal", "1e3")
         assert _float_tail(state, schema, ",") is None
 
     def test_no_trigger_on_digit_continuation(self) -> None:
-        """Sólo dispara al CERRAR. Un token que sigue el número no cierra."""
+        """Only fires on CLOSE. A token continuing the number does not close."""
         state, schema = _at_number("principal", "2")
         assert _float_tail(state, schema, "5") is None
         assert _float_tail(state, schema, ".") is None
 
     def test_no_trigger_after_number_closed(self) -> None:
-        """Fuera de IN_NUMBER_VALUE no hay literal que completar."""
+        """Outside IN_NUMBER_VALUE there is no literal to complete."""
         state, schema = _at_number("principal", "2")
         step(state, schema, ",")
         assert state.phase is not DecoderPhase.IN_NUMBER_VALUE
         assert _float_tail(state, schema, "}") is None
 
     def test_no_trigger_at_depth_zero_name(self) -> None:
-        """El value de "name" es depth 0 y su tipo esperado es string.
+        """The "name" value is depth 0 and its expected type is string.
 
-        Aunque la grammar no lo sepa y acepte `{"name": 2`, el expected type
-        NO es "number" → nada que completar.
+        Even if the grammar does not know it and accepts `{"name": 2`, the
+        expected type is NOT "number" -> nothing to complete.
         """
         state = DecoderState()
         schema = SchemaContext(MIXED_FUNCTIONS)

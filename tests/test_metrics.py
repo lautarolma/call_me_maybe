@@ -1,9 +1,10 @@
-"""Unit tests for src/utils/metrics.py per-phase metrics (Task 5 pre-work)."""
+"""Unit tests for src/utils/metrics.py per-phase metrics."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -22,13 +23,13 @@ def test_phase_metrics_accumulate_and_serialize() -> None:
     report = run.report()
     assert report["warm_up_discarded"] is True
 
-    phases = report["phases"]
+    phases = cast(dict[str, Any], report["phases"])
     assert phases["IN_KEY"]["total_forwards"] == 2
     assert phases["IN_KEY"]["skips_if_single"] == 2
     assert phases["IN_KEY"]["elapsed_time_ms"] == 1.5
     assert phases["IN_STRING_VALUE"]["total_forwards"] == 1
 
-    totals = report["totals"]
+    totals = cast(dict[str, Any], report["totals"])
     assert totals["total_forwards"] == 3
     assert totals["skips_if_single"] == 2
 
@@ -71,17 +72,17 @@ def test_report_prompt_metrics_persists_one_entry_per_prompt(
     assert [p["index"] for p in payload["per_prompt"]] == [0, 1]
     assert [p["total_forwards"] for p in payload["per_prompt"]] == [3, 2]
     assert payload["totals"] == {"total_forwards": 5, "elapsed_time_ms": 4000.0}
-    # La tabla va a stdout: es la evidencia que se pega en el informe.
+    # The table goes to stdout: it is the evidence pasted into the report.
     assert "  3" in capsys.readouterr().out
 
 
 def test_report_prompt_metrics_survives_a_prompt_without_forwards(
     tmp_path: Path,
 ) -> None:
-    """Un prompt resuelto 100% por oráculo tiene 0 forwards: s/fwd no existe.
+    """A prompt solved 100% by the oracle has 0 forwards: s/fwd does not exist.
 
-    Dividir por cero NOMÁS abajo tumbaría la corrida completa, que es
-    justo lo que el conteo de forwards viene a documentar.
+    Dividing by zero right there would bring the whole run down, which is
+    exactly what the forwards count comes to document.
     """
     path = tmp_path / "decode_metrics.json"
 

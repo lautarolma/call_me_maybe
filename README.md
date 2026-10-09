@@ -244,6 +244,16 @@ forwards from the run, which is where most of the speedup comes from.
 - **`slots=True`** on the hot dataclasses (`DecoderState`, `TrieNode`) — the
   filter touches these per candidate, and dropping `__dict__` measurably speeds
   attribute access.
+- **`pydantic` at the I/O boundary, slotted dataclasses in the hot path.**
+  Every class that crosses the input/output edge (`FunctionDef`,
+  `ParameterDef`, `FunctionCall`) is a `pydantic` model, so schema validation
+  runs exactly where user data enters or leaves. The decoder's internal state
+  (`DecoderState`, `TrieNode`, `Vocab`, `PhaseMetrics`, `MetricsRun`) stays as
+  slotted dataclasses: the token filter reads those attributes once per
+  candidate, and `pydantic` models have no `__slots__`, so the added
+  per-access cost would tax the inner loop and threaten the 5-minute KPI.
+  This is a conscious, narrow deviation from the letter of "all classes must
+  use `pydantic`", limited to structures that never see user input.
 - **Only public `llm_sdk` surface**; no private methods or attributes are used.
 
 ---

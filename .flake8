@@ -1,6 +1,6 @@
 [flake8]
 max-line-length = 120
-# `moulinette` es el código del EVALUADOR (la herramienta que nos califica),
-# no código nuestro. No lo linteamos: sus errores no son nuestros y el
-# subject dice que se evalúa solo el trabajo del repositorio del alumno.
+# `moulinette` is the GRADER's own code (the tool that scores us), not ours.
+# We do not lint it: its findings are not our findings, and the subject
+# states that only the student's repository work is evaluated.
 extend-exclude = .venv,llm_sdk,moulinette

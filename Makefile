@@ -7,7 +7,7 @@ run:
 	uv run python -m src $(ARGS)
 
 debug:
-	uv run python -m src --help
+	uv run python -m pdb -m src
 
 clean:
 	rm -rf __pycache__ .mypy_cache .pytest_cache

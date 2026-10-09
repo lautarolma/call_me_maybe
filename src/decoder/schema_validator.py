@@ -379,7 +379,7 @@ class SchemaContext:
         if self._phase is DecoderPhase.COLON:
             text = token_text.lstrip()
             if not text or text[0] not in "-0123456789":
-                return True  # el token no abre un number
+                return True  # the token does not open a number
         for char in text:
             if char in _NUMBER_TERMINATORS:
                 break

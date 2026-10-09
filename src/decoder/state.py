@@ -235,7 +235,7 @@ class DecoderState:
             case _:
                 return False
 
-    # -------------------------------------------------- step handlers por rol
+    # -------------------------------------------------- step handlers by role
 
     def _step_root(self, char: str) -> bool:
         if char in _WS:

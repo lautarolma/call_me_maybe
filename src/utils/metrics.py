@@ -7,9 +7,8 @@ how benchmarks capture per-phase generation metrics.
   on this module (the metrics interface) instead of the timer implementation.
 - ``PhaseMetrics`` / ``MetricsRun`` provide a typed, serializable breakdown of
   a generation run: total forwards, skip-if-single count and elapsed time,
-  bucketed by :class:`~src.decoder.state.DecoderPhase`. The benchmark writer
-  is responsible for discarding the warm-up pass (see the benchmark scripts);
-  ``MetricsRun.write_json`` reports with ``warm_up_discarded: true``.
+  bucketed by :class:`~src.decoder.state.DecoderPhase`. The per-phase numbers
+  are exposed through ``to_dict()`` and ``totals()``.
 """
 
 from __future__ import annotations
@@ -56,7 +55,7 @@ class MetricsRun:
     """Accumulator of per-phase generation metrics for a benchmark run.
 
     A single instance can be shared across prompts; counters accumulate per
-    phase. Use :meth:`to_dict` / :meth:`write_json` for the structured report.
+    phase. Use :meth:`to_dict` / :meth:`totals` for the serialized breakdown.
     """
 
     phases: dict[str, PhaseMetrics] = field(default_factory=dict)
@@ -103,24 +102,6 @@ class MetricsRun:
             ),
         }
 
-    def report(self) -> dict[str, object]:
-        """Full structured report payload.
-
-        Includes the ``warm_up_discarded`` flag: the benchmark protocol
-        always runs one discarded warm-up pass before measuring (see the
-        criterion in the benchmark scripts).
-        """
-        return {
-            "warm_up_discarded": True,
-            "totals": self.totals(),
-            "phases": self.to_dict(),
-        }
-
-    def write_json(self, path: Path) -> None:
-        """Write the structured report to ``path`` (creates parents)."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.report(), indent=2, sort_keys=True))
-
 
 @contextmanager
 def track_prompt(index: int) -> Iterator[None]:
@@ -163,10 +144,10 @@ def report_prompt_metrics(
     The `s/fwd` column is the counterpart: if it rises while the forward
     count stays the same, the machine was slower per operation.
 
-    WHY IT DOES NOT REUSE `MetricsRun.report()`: that method hardcodes
-    `warm_up_discarded: True`, which describes the benchmark protocol (one
-    warm-up pass is discarded). The pipeline discards none, so writing that
-    `true` into the JSON would be false data in the evidence.
+    WHY THE PAYLOAD IS BUILT HERE: this writer persists a PER-PROMPT table
+    (one entry per prompt) plus the run totals, a shape owned by the pipeline
+    evidence. `MetricsRun` only exposes the per-phase primitives (`to_dict()`
+    and `totals()`) that this payload is assembled from.
 
     Args:
         runs: One `MetricsRun` per prompt, in the order they ran.

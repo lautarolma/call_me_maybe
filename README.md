@@ -260,33 +260,39 @@ The KPI was *11-prompt suite under 5 minutes* on real CPU. Starting from a naive
 the model's critical path:
 
 ```
-  Stage                            | Wall time | Forwards
-  ---------------------------------+-----------+----------
-  Original (all from the model)    |  34.9 min |     ~638
-  Pre-index refactor               |  27.6 min |     ~638
-  Static header (Opt2)             |   15.1 min|     314
-  State-keyed oracle (N1)          |    7.6 min|     133
-  VM tuned (4 vCPU, exec cap 80)   |    4:53   |     133  <-- KPI met
+  Stage                                    | Wall time | Forwards
+  -----------------------------------------+-----------+----------
+  Original (all from the model)            |  34.9 min |     ~638
+  Pre-index refactor                       |  27.6 min |     ~638
+  Static header (Opt2)                     |  15.1 min |     314
+  State-keyed oracle (N1)                  |   7.6 min |     133
+  VM tuned (4 vCPU, exec cap 80)           |    4:53   |     133
+  Campus eval (i5-8500, 6 thr, CPU-only)   |    2:43   |     137  <-- KPI met
   ------------------------------------------------------------------
 
   ── optimization achieved (bar length = speedup vs the original) ──
 
-  VM tuned (4 vCPU, exec cap 80)   ████████████████████  7.2x   4:53    🚀
-  State-keyed oracle (N1)          █████████████        4.6x   7.6 min
-  Static header (Opt2)             ██████                2.3x   15.1 min
-  Pre-index refactor               ████                  1.3x   27.6 min
-  Original (all from the model)    ███                   1.0x   34.9 min
+  Campus eval (i5-8500, CPU-only)          ████████████████████████████████████ 12.8x  2:43  🚀
+  VM tuned (4 vCPU, exec cap 80)           ████████████████████  7.2x   4:53
+  State-keyed oracle (N1)                  █████████████        4.6x   7.6 min
+  Static header (Opt2)                     ██████               2.3x  15.1 min
+  Pre-index refactor                       ████                 1.3x  27.6 min
+  Original (all from the model)            ███                  1.0x  34.9 min
 ```
 
-**~7.2x faster and ~4.8x fewer forwards** than the original. The decisive lever
-was the oracle: it cut the structural forwards to zero, because by the time the
-function is known the punctuation is fully determined.
+**12.8x faster on the evaluation box (7.2x on the tuned VM) and ~4.7x fewer
+forwards** than the original. The decisive lever was the oracle: it cut the
+structural forwards to zero, because by the time the function is known the
+punctuation is fully determined.
 
-> ⚠️ The table is the historical optimization series and the 133-forward row
-> stands: the accuracy repairs (next section) run in the validator, *after*
-> generation — measured cost ≈0.4 ms per 11-prompt suite, zero forwards added.
-> The KPI wall-clock is validated on the evaluation machine (the tuned-VM row,
-> 4:53, was a clean run).
+> ⚠️ The table is the historical optimization series. The **133** rows are the
+> pre-float-coercion counts: `aed4c14` closed `"number"` as float, adding 4
+> forwards → **137**, the count the current code emits (confirmed on three
+> independent runs, hardware-independent). The accuracy *repairs* stay in the
+> validator, *after* generation (~0.4 ms per 11-prompt suite, zero forwards).
+> The KPI wall-clock is validated on the actual evaluation machine — a campus
+> box (Intel i5-8500, 6 threads, CPU-only, cold HF cache): **2:43** for the
+> 11-prompt suite, against the 5-minute budget.
 
 ### 🎯 Accuracy
 
@@ -318,17 +324,22 @@ valid JSON by construction.
 
 ### Why CPU-only, and what it forced
 
-This ran entirely on CPU, inside a virtual machine:
+This ran entirely on CPU:
 
-- The GPU on the host is not passed through to the VM. The subject forbids
-  adding any ML framework of our own, and the vendored `llm_sdk` is the only
-  code that touches `torch`; pinning it to the **CPU-only** wheel avoids the
-  CUDA/`transformers` stack entirely. `src/` imports neither `torch` nor
-  `numpy` — it drives the SDK's public API with plain Python and `pydantic`.
-- The VM was originally configured with 6 vCPUs on 4 physical cores, which
-  caused oversubscription. After diagnosing it, the VM was set to 4 vCPU (1:1
-  with physical cores) plus an 80% execution cap so the host OS keeps breathing.
-  This alone moved the clean run to 4:53.
+- **No GPU is available to the workload.** The subject forbids adding any ML
+  framework of our own, and the vendored `llm_sdk` is the only code that touches
+  `torch`; pinning it to the **CPU-only** wheel avoids the CUDA/`transformers`
+  stack entirely. `src/` imports neither `torch` nor `numpy` — it drives the
+  SDK's public API with plain Python and `pydantic`. The benchmark's GPU pass was
+  *skipped* on the evaluation box (no CUDA visible to torch), which is fine: the
+  deliverable is CPU-only by design.
+- **The dev VM was oversubscribed.** It started on 6 vCPUs over 4 physical cores;
+  after diagnosing it, it was set to 4 vCPU (1:1 with physical cores) plus an 80%
+  execution cap so the host OS keeps breathing. Tuning alone moved the clean run
+  to 4:53.
+- **The evaluation box is faster than the VM.** The machine the suite is graded
+  on — a campus box (Intel i5-8500, 6 cores, CPU-only) — runs it in **2:43**. The
+  gap is the host, not the code: the forward count is hardware-independent.
 - The SDK has **no KV-cache** — each forward re-feeds the whole sequence — so
   the workload is compute-bound, not candidate-bound. That is precisely *why*
   cutting forwards (the oracle) beats cutting candidates per forward.
